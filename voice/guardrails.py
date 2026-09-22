@@ -31,14 +31,20 @@ def is_chitchat(question: str) -> bool:
     return bool(_CHITCHAT_RE.search(question))
 
 
-def abstain_reply(question: str) -> str:
+def abstain_reply(question: str, has_history: bool = False) -> str:
     """Respuesta fija para cuando no hay CONTEXTO y la pregunta no es charla social.
 
     Antes de esto, el system_prompt le decía al LLM "si no hay CONTEXTO, respondé como asistente
     general" -- y eso es justo lo que lo llevaba a inventar que "Juan Carlos" (sin ningún documento
     que lo mencione) es el Rey de España: el nombre coincide con una persona real y famosa, y el
     modelo la trae de su conocimiento general aunque no tenga nada que ver con este asistente de
-    oficina. Cortar acá, sin llamar al LLM, elimina el riesgo por completo para este camino."""
+    oficina. Cortar acá, sin llamar al LLM, elimina el riesgo por completo para este camino.
+
+    Con historial, la pregunta ya pasó por voice/rewrite.py -- si aun así no encontró nada, puede
+    ser que la reescritura no haya resuelto bien la referencia, así que se lo decimos al usuario en
+    vez de la respuesta genérica (que sonaría rara después de varias vueltas de conversación)."""
+    if has_history:
+        return "No lo encontré, ¿me lo preguntás de otra forma?"
     if _PERSON_RE.search(question):
         return "No tengo información sobre esa persona."
     return "No tengo información sobre eso."

@@ -6,10 +6,76 @@
 #   id:       nombre corto, único, sin espacios
 #   note:     por qué existe este caso / qué bug prueba (opcional pero recomendado)
 #   expect:   qué se espera que pase, en texto libre, para ayudar a juzgar (opcional)
+#   type:     'rewrite' para probar SOLO voice/rewrite.py aislado (ver más abajo); si no está,
+#             es un caso de pipeline completo (default)
 #   turns:    lista de preguntas del usuario en orden (una charla; se resetea el historial entre casos)
 #   variants: en vez de 'turns', varias formulaciones distintas del mismo caso (lista de listas de
 #             turnos). Con temperature=0 (determinístico) repetir la MISMA pregunta no sirve para medir
 #             nada -- 'variants' mide robustez a CÓMO se pregunta, no al muestreo aleatorio.
+#
+# Casos type: rewrite (prueban voice/rewrite.py sin pasar por RAG ni el LLM de respuesta):
+#   history:  lista de [pregunta_usuario, respuesta_asistente] -- la charla previa
+#   question: el turno a reescribir
+#   expect:   cómo debería quedar la pregunta reescrita (texto libre, lo juzga un humano/Claude)
+
+- id: rewrite_referencia_simple
+  type: rewrite
+  note: caso base -- resolver "y los sábados" usando el turno anterior
+  expect: "¿A qué hora abre la oficina los sábados?' o equivalente"
+  history:
+    - ["¿A qué hora abre la oficina el domingo?", "La oficina no abre el domingo, está cerrada."]
+  question: "y los sábados"
+
+- id: rewrite_correccion_explicita
+  type: rewrite
+  note: >
+    el caso que disparó todo esto -- el usuario corrige el día, la reescritura debe usar la
+    corrección (sábado) y no lo que se venía hablando (domingo)
+  expect: "¿A qué hora abre la oficina el sábado?' o equivalente, NO debe mencionar domingo"
+  history:
+    - ["¿A qué hora abre la oficina el domingo?", "La oficina no abre el domingo, está cerrada."]
+  question: "Te pregunté el sábado a qué hora abre."
+
+- id: rewrite_correccion_no
+  type: rewrite
+  note: variante de corrección con "No, ..." al principio
+  expect: "¿A qué hora abre la oficina el sábado?' o equivalente"
+  history:
+    - ["¿A qué hora abre la oficina el domingo?", "La oficina no abre el domingo, está cerrada."]
+  question: "No, te pregunté por el sábado."
+
+- id: rewrite_cambio_de_tema_total
+  type: rewrite
+  note: >
+    la pregunta ya es autónoma y no tiene nada que ver con el historial -- no debería
+    "contaminarse" con el tema anterior (horarios)
+  expect: "básicamente igual a la pregunta original, sobre restablecer la contraseña"
+  history:
+    - ["¿A qué hora abre la oficina los sábados?", "Los sábados abre de diez a una de la tarde."]
+  question: "¿Cómo puedo restablecer la contraseña del correo?"
+
+- id: rewrite_meta_pregunta_sobre_el_asistente
+  type: rewrite
+  note: >
+    pregunta sobre el propio asistente (no sobre los documentos) -- no debería forzarse a hablar
+    del tema anterior tampoco
+  expect: "básicamente igual a la pregunta original, sobre por qué demora en responder"
+  history:
+    - ["¿A qué hora abre la oficina los sábados?", "Los sábados abre de diez a una de la tarde."]
+  question: "¿Por qué demoras tanto en responder?"
+
+- id: rewrite_referencia_dos_turnos_atras
+  type: rewrite
+  note: >
+    RESULTADO AMBIGUO (22/09): dio "¿Y cuántos días dijiste que eran?" -- no resolvió la
+    referencia. Pero el caso en sí es ambiguo (los dos turnos previos mencionan "días": veinte
+    días de vacaciones Y dos días de trabajo remoto), así que no es una señal limpia de que
+    rewrite.history_turns=2 no funcione -- habría que un caso menos ambiguo para confirmar esto.
+  expect: "algo como '¿Cuántos días de vacaciones tengo por año?' -- debe volver al tema de vacaciones"
+  history:
+    - ["¿Cuántos días de vacaciones tengo por año?", "Tenés veinte días de vacaciones por año."]
+    - ["¿Y el trabajo remoto?", "Está permitido dos días por semana."]
+  question: "¿y cuántos días dije que eran?"
 
 - id: horario_sabado_directo
   note: caso de control, pregunta simple con respuesta clara en oficina.md
@@ -31,8 +97,10 @@
 
 - id: followup_corto_mismo_tema
   note: >
-    regresión del bug de "sticky hits" (README, sección "Bug real: el RAG perdía contexto en
-    follow-ups cortos") — un follow-up de 2 palabras solo no recuperaba nada del RAG
+    regresión del bug original de "y los follow-ups cortos no recuperan nada del RAG" (README).
+    Antes lo resolvía el fallback de sticky-hits (heredar los hits del turno anterior tal cual);
+    ahora lo resuelve la reescritura de consulta (voice/rewrite.py), que convierte "y eso" en una
+    pregunta autónoma antes del retrieval -- sticky-hits se eliminó por completo. Sigue pasando.
   expect: "'y eso' debe seguir hablando de que el domingo está cerrado, sin contradecirse"
   turns:
     - "¿A qué hora abre la oficina el domingo?"
@@ -40,15 +108,11 @@
 
 - id: cambio_de_dia_en_followup
   note: >
-    BUG ABIERTO (22/09, no se tocó código todavía -- esto es "bug A", prioridad 2). Diagnóstico
-    con --show-chunk-text confirmó que el chunk correcto (con sábados Y domingos) casi siempre SE
-    RECUPERA bien -- no es un bug de retrieval, es el modelo ignorando el dato correcto que tiene
-    delante. Con las 5 variantes: 2/5 responden bien, 1/5 sigue hablando de domingo (el bug
-    original, textual), y 2/5 ahora ABSTIENEN en vez de responder -- efecto secundario nuevo: esas
-    2 formulaciones (>4 palabras) no recuperan nada solas y no califican para el fallback de
-    sticky-hits (heurístico de "corto" ≤4 palabras), así que la abstención determinista corta ahí
-    aunque el dato SÍ estaba disponible 2 turnos atrás. A discutir: ¿subir el umbral de "corto", o
-    hacer que el abstain también intente sticky-hits antes de rendirse?
+    FIJADO (22/09): con sticky-hits, 2/5 bien, 1/5 seguía hablando de domingo, 2/5 abstenían de más.
+    Con la reescritura de consulta (voice/rewrite.py) -- el LLM de respuesta tampoco ve más el
+    historial, solo la pregunta ya reescrita + el CONTEXTO de este turno -- ahora 5/5 responden bien
+    sobre el sábado. El "y eso" del medio también se resuelve bien en las 5 (necesitó un ejemplo
+    few-shot específico para continuaciones vacías tipo "y eso"/"eso mismo", ver voice/rewrite.py).
   expect: "debe responder específicamente sobre el sábado (10 a 13hs), no repetir lo del domingo"
   variants:
     - ["¿A qué hora abre la oficina el domingo?", "y eso", "Te pregunté el sábado a qué hora abre."]
@@ -59,8 +123,11 @@
 
 - id: comentario_sin_tema_no_corta_continuidad
   note: >
-    regresión del bug de "expandir con el tema equivocado" — un comentario sin tema en medio de
-    la charla no debe hacer que se pierda el contexto real para el siguiente follow-up corto
+    regresión del bug de "expandir con el tema equivocado" — un comentario sin tema en medio de la
+    charla no debe hacer que se pierda el contexto real para el siguiente follow-up corto. Antes lo
+    resolvía sticky-hits (no lo actualizaba en un turno sin hits); ahora depende de que la
+    reescritura mire el historial completo (últimos rewrite.history_turns=2 turnos) y no solo el
+    turno inmediatamente anterior. Sigue pasando.
   expect: "el último turno debe volver a hablar del horario de sábados, no inventar 'oficina de soporte técnico'"
   turns:
     - "¿A qué hora abre la oficina los sábados?"

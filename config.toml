@@ -55,16 +55,24 @@ max_tokens = 200
 temperature = 0.0          # greedy/determinístico. Con >0 la misma conversación podía dar resultados
                             # distintos entre corridas (ver tests/eval_questions.yaml); con 0 se puede
                             # comparar de verdad si un cambio arregló algo, sin ruido de muestreo
-history_turns = 4
-system_prompt = """Eres un asistente de voz local. Respondes siempre en español, en 1 a 3 frases cortas y naturales, como si hablaras en voz alta.
-No uses markdown, listas, emojis ni símbolos. Escribe los números y unidades como se pronuncian.
+# El LLM de respuesta YA NO recibe el historial de la charla (ver [rewrite] y voice/rewrite.py): recibe
+# la pregunta ya reescrita como autónoma + el CONTEXTO de este turno, nada más. Antes el system_prompt
+# tenía una regla de "priorizá el CONTEXTO sobre lo que dijiste antes" -- ya no aplica, no hay "antes".
+system_prompt = """Eres un asistente de voz local. Respondés siempre en español, en 1 a 3 frases cortas y naturales, como si hablaras en voz alta.
+No uses markdown, listas, emojis ni símbolos. Escribí los números y unidades como se pronuncian.
+La pregunta que recibís ya viene formulada como autónoma, sin depender de una charla previa.
 Antes de usar el CONTEXTO, fijate si realmente tiene que ver con la pregunta. Si tiene que ver, úsalo
 para responder y no inventes datos (horarios, precios, nombres) que no estén ahí; si no contiene la
-respuesta, decilo con honestidad. Si el CONTEXTO NO tiene que ver con la pregunta (por ejemplo, te
-preguntan algo casual o personal y el CONTEXTO habla de otro tema), ignoralo por completo y respondé
-como asistente general, sin forzarlo ni mencionarlo.
-El CONTEXTO es siempre la fuente más confiable, más que lo que vos mismo dijiste antes en la charla: si
-se contradicen, priorizá el CONTEXTO y corregite."""
+respuesta, decilo con honestidad. Si el CONTEXTO no tiene que ver con la pregunta, ignoralo por
+completo y respondé como asistente general, sin forzarlo ni mencionarlo."""
+
+[rewrite]
+# Reescribe la pregunta de seguimiento en una autónoma ANTES del retrieval (reemplaza al viejo
+# fallback de "sticky hits"). Ver voice/rewrite.py y README. Usa el mismo LLM (Qwen2.5-3B), una
+# llamada extra por turno -- solo si hay historial; el primer turno de la charla no la paga.
+enabled = true
+history_turns = 2          # últimos N turnos (usuario+asistente) que ve el reescritor
+max_tokens = 40             # una pregunta reescrita es corta; esto es tope, no objetivo
 
 [tts]
 voice = "es_AR-daniela-high"

@@ -1,4 +1,4 @@
-"""Orquestación: wake word → VAD → Whisper → RAG → LLM → Piper."""
+"""Orquestación: wake word → VAD → Whisper → reescritura de consulta → RAG → LLM → Piper."""
 from __future__ import annotations
 
 import time
@@ -22,10 +22,13 @@ POST_WAKE_SKIP_MS = 200  # descarta la cola de la propia palabra de activación 
 @dataclass
 class Turn:
     """Resultado y métricas (segundos) de un turno de conversación."""
-    question: str = ""
+    question: str = ""             # lo que dijo/escribió el usuario, tal cual
+    retrieval_query: str = ""      # pregunta usada para RAG (== question si no hubo reescritura)
+    was_rewritten: bool = False
     answer: str = ""
     context_hits: list = field(default_factory=list)
     t_stt: float = 0.0
+    t_rewrite: float = 0.0
     t_rag: float = 0.0
     t_llm_first_token: float = 0.0
     t_llm_total: float = 0.0
@@ -49,20 +52,18 @@ class Assistant:
         self.rag = Retriever(cfg.rag) if cfg.rag.enabled else None
         log(f"RAG: {len(self.rag.chunks) if self.rag else 0} chunks")
         t = time.monotonic()
-        self.llm = LocalLLM(cfg.llm)
+        self.llm = LocalLLM(cfg.llm, cfg.rewrite)
         log(f"LLM listo ({time.monotonic() - t:.1f}s)")
         self.tts = PiperTTS(cfg.tts)
         self.speaker = Speaker(cfg.audio.speaker_name) if speak else None
         self.vad = UtteranceRecorder(cfg.vad, cfg.audio.sample_rate)
         self.wake = WakeWord(cfg.wakeword) if cfg.wakeword.enabled else None
         self.mic = Mic(cfg.audio.sample_rate, cfg.audio.mic_name)
-        self._sticky_hits: list = []  # últimos hits de RAG que SÍ tuvieron contexto (ver _retrieve_sticky)
 
     def reset_conversation(self) -> None:
-        """Arranca una charla nueva: limpia historial del LLM y el contexto RAG heredado (usado por
+        """Arranca una charla nueva: limpia el historial que usa voice/rewrite.py (usado por
         scripts/eval.py entre casos de prueba, para que uno no contamine al siguiente)."""
         self.llm.reset()
-        self._sticky_hits = []
 
     # ---- un turno: audio -> texto -> respuesta hablada -------------------------------------
     def transcribe(self, audio: np.ndarray) -> tuple[str, float]:
@@ -70,37 +71,16 @@ class Assistant:
         text = self.stt.transcribe(audio)
         return text, time.monotonic() - t
 
-    _FOLLOWUP_MAX_WORDS = 4  # "y eso", "y los sábados", "¿y los sábados?" caen acá; una pregunta
-                              # completa que simplemente no tiene doc relacionado, no
-
-    def _retrieve_sticky(self, question: str) -> list:
-        """Recupera con la pregunta sola. Si no trae nada Y la pregunta es corta (probable follow-up
-        tipo "y los sábados", que no trae señal suficiente para el embedding solo — ver README), reusa
-        los hits del último turno que sí tuvo contexto, tal cual (sin reconstruir una query combinada:
-        eso es lo que causaba el bug de "expandir con el tema equivocado" cuando el turno inmediatamente
-        anterior era en sí mismo un comentario casual sin tema). Un turno largo sin hits no hereda nada
-        (probablemente no hay doc relacionado) y tampoco borra lo heredable para el próximo turno corto
-        — así un comentario de paso entre dos preguntas del mismo tema no corta la continuidad."""
-        hits = self.rag.retrieve(question)
-        if not hits and len(question.split()) <= self._FOLLOWUP_MAX_WORDS:
-            hits = self._sticky_hits
-        if hits:
-            self._sticky_hits = hits
-        return hits
-
-    def _abstain(self, question: str, turn: Turn, t0: float) -> Turn:
-        """Corta acá sin llamar al LLM (ver voice/guardrails.py): sin esto, "responder como
-        asistente general" era justo lo que llevaba a inventar identidades (bug 'Juan Carlos es el
-        Rey de España', ver README)."""
-        answer_text = abstain_reply(question)
+    def _abstain(self, question: str, turn: Turn, t0: float, has_history: bool) -> Turn:
+        """Corta acá sin llamar al LLM de respuesta (ver voice/guardrails.py): sin esto, "responder
+        como asistente general" era justo lo que llevaba a inventar identidades (bug 'Juan Carlos es
+        el Rey de España', ver README)."""
+        answer_text = abstain_reply(turn.retrieval_query, has_history)
         out = StreamingSpeaker(self.tts, self.speaker)
         print(f"🤖 {answer_text}", flush=True)
         out.say(answer_text)
         out.finish()
-        self.llm.history += [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer_text},
-        ]
+        self.llm.record_turn(question, answer_text)
         turn.answer = answer_text
         if out.first_audio_at:
             turn.t_first_audio = out.first_audio_at - t0
@@ -111,14 +91,23 @@ class Assistant:
     def answer(self, question: str, t_user_done: float | None = None) -> Turn:
         turn = Turn(question=question)
         t0 = t_user_done or time.monotonic()
+        has_history = bool(self.llm.history)
 
         t = time.monotonic()
-        hits = self._retrieve_sticky(question) if self.rag else []
+        retrieval_query, was_rewritten = self.llm.rewrite_query(question)
+        turn.t_rewrite = time.monotonic() - t
+        turn.retrieval_query = retrieval_query
+        turn.was_rewritten = was_rewritten
+        if was_rewritten:
+            print(f"   (reescrita: {retrieval_query!r})", flush=True)
+
+        t = time.monotonic()
+        hits = self.rag.retrieve(retrieval_query) if self.rag else []
         turn.t_rag = time.monotonic() - t
         turn.context_hits = hits
 
-        if self.rag and not hits and not is_chitchat(question):
-            return self._abstain(question, turn, t0)
+        if self.rag and not hits and not is_chitchat(retrieval_query):
+            return self._abstain(question, turn, t0, has_history)
 
         context = Retriever.format_context(hits) if hits else None
 
@@ -129,7 +118,9 @@ class Assistant:
 
         def counted():
             nonlocal first
-            for tok in self.llm.stream_reply(question, context):
+            # el LLM de respuesta recibe la pregunta YA reescrita/autónoma, sin el historial de la
+            # charla (ver voice/llm.py: stream_answer es stateless a propósito)
+            for tok in self.llm.stream_answer(retrieval_query, context):
                 if first is None:
                     first = time.monotonic()
                 tokens.append(tok)
@@ -145,6 +136,9 @@ class Assistant:
         turn.n_tokens = len(tokens)
         turn.answer = "".join(tokens).strip()
         out.finish()
+        # se guarda la pregunta ORIGINAL (no la reescrita): así la próxima reescritura ve la charla
+        # tal como pasó de verdad, no una versión ya "limpiada" de sí misma.
+        self.llm.record_turn(question, turn.answer)
         if out.first_audio_at:
             turn.t_first_audio = out.first_audio_at - t0
         if out.collected:
@@ -154,8 +148,9 @@ class Assistant:
     def print_metrics(self, t: Turn) -> None:
         tps = t.n_tokens / t.t_llm_total if t.t_llm_total else 0
         print(
-            f"   ⏱ stt {t.t_stt:.2f}s | rag {t.t_rag * 1000:.0f}ms | llm 1er token {t.t_llm_first_token:.2f}s, "
-            f"{t.n_tokens} tok @ {tps:.1f} tok/s | fin de voz → 1er audio {t.t_first_audio:.2f}s",
+            f"   ⏱ stt {t.t_stt:.2f}s | rewrite {t.t_rewrite * 1000:.0f}ms | rag {t.t_rag * 1000:.0f}ms | "
+            f"llm 1er token {t.t_llm_first_token:.2f}s, {t.n_tokens} tok @ {tps:.1f} tok/s | "
+            f"fin de voz → 1er audio {t.t_first_audio:.2f}s",
             flush=True,
         )
 

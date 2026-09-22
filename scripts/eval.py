@@ -2,15 +2,22 @@
 vuelca todo a un archivo Markdown. Herramienta de desarrollo, no de producción: no calcula pass/fail
 solo -- el juicio de si cada caso está bien lo hace un humano (o Claude) leyendo el resultado.
 
+Dos tipos de caso:
+  - pipeline (default): corre la conversación completa (reescritura -> RAG -> LLM -> respuesta).
+  - rewrite: prueba SOLO voice/rewrite.py en aislado (historial + pregunta -> pregunta autónoma),
+    sin retrieval ni LLM de respuesta. Sirve para saber si un fallo es de la reescritura o de lo
+    que pasa después, sin tener que adivinar.
+
     python scripts/eval.py                        # corre todos los casos de tests/eval_questions.yaml
     python scripts/eval.py --cases tests/otro.yaml
     python scripts/eval.py --out eval_results/mi_corrida.md
-    python scripts/eval.py --show-chunk-text       # además del source@score, el texto completo del
-                                                    # chunk recuperado (para diagnosticar si el RAG
-                                                    # trajo lo que debía, sin adivinar)
+    python scripts/eval.py --only cambio_de_dia_en_followup
+    python scripts/eval.py --show-chunk-text       # texto completo de cada chunk recuperado, no
+                                                    # solo source@score
 """
 import argparse
 import datetime
+import statistics
 import sys
 from pathlib import Path
 
@@ -23,15 +30,45 @@ import voice  # noqa: F401,E402  (importa llama_cpp primero)
 from voice.config import load_config  # noqa: E402
 from voice.pipeline import Assistant  # noqa: E402
 
+rewrite_latencies_ms: list[float] = []  # se llena en run_case(), se reporta al final
+
 
 def case_variants(case: dict) -> list[tuple[str | None, list[str]]]:
     """Con temperature=0 (determinístico) repetir la MISMA pregunta no aporta nada -- por eso
-    'variants' reemplaza al viejo 'repeat': varias formulaciones distintas del mismo caso, para
+    'variants' reemplazó a un viejo 'repeat': varias formulaciones distintas del mismo caso, para
     medir robustez a cómo se pregunta en vez de robustez al muestreo aleatorio."""
     if "variants" in case:
         n = len(case["variants"])
         return [(f"variante {i}/{n}", v) for i, v in enumerate(case["variants"], 1)]
     return [(None, case["turns"])]
+
+
+def run_rewrite_case(bot: Assistant, case: dict) -> list[str]:
+    """Caso 'type: rewrite': prueba voice/rewrite.py aislado. `history` es una lista de
+    [pregunta_usuario, respuesta_asistente]; `question` es el turno a reescribir."""
+    bot.reset_conversation()
+    for u, a in case["history"]:
+        bot.llm.record_turn(u, a)
+
+    import time
+    t0 = time.monotonic()
+    out, was_rewritten = bot.llm.rewrite_query(case["question"])
+    dt_ms = (time.monotonic() - t0) * 1000
+    rewrite_latencies_ms.append(dt_ms)
+
+    lines = [f"## {case['id']} (rewrite)"]
+    if case.get("note"):
+        lines.append(f"> **nota:** {case['note'].strip()}")
+    if case.get("expect"):
+        lines.append(f"> **se espera:** {case['expect'].strip()}")
+    lines.append("")
+    for u, a in case["history"]:
+        lines.append(f"- 🗣 {u}")
+        lines.append(f"  - 🤖 {a}")
+    lines.append(f"- 🗣 **{case['question']}**")
+    lines.append(f"  - ➜ reescrita: **{out}** (se_reescribió={was_rewritten}, {dt_ms:.0f}ms)")
+    lines.append("")
+    return lines
 
 
 def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], show_chunk_text: bool) -> list[str]:
@@ -46,7 +83,11 @@ def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], sh
     lines.append("")
     for q in turns:
         turn = bot.answer(q)
+        if turn.t_rewrite:
+            rewrite_latencies_ms.append(turn.t_rewrite * 1000)
         lines.append(f"- 🗣 **{q}**")
+        if turn.was_rewritten:
+            lines.append(f"  - ➜ reescrita: {turn.retrieval_query!r}")
         lines.append(f"  - 🤖 {turn.answer}")
         if not turn.context_hits:
             lines.append("  - RAG: *(sin contexto)*")
@@ -83,8 +124,32 @@ def main() -> None:
     header = [f"# Eval run — {datetime.datetime.now():%Y-%m-%d %H:%M} — {cases_path.name}", ""]
     body: list[str] = []
     for case in cases:
-        for label, turns in case_variants(case):
-            body += run_case(bot, case, label, turns, args.show_chunk_text)
+        if case.get("type") == "rewrite":
+            body += run_rewrite_case(bot, case)
+        else:
+            for label, turns in case_variants(case):
+                body += run_case(bot, case, label, turns, args.show_chunk_text)
+
+    if rewrite_latencies_ms:
+        def pct(xs, p):
+            xs = sorted(xs)
+            return xs[min(len(xs) - 1, int(len(xs) * p))]
+
+        all_ms = rewrite_latencies_ms
+        # el camino "sin historial" (rewrite_query hace early-return) tarda microsegundos, no 0ms
+        # exacto -- 5ms es un umbral seguro por debajo de lo que tarda cualquier llamada real al LLM
+        fired_ms = [m for m in all_ms if m > 5]
+        body.append(
+            f"**Latencia de reescritura** (todos los turnos, incluye primer-turno en 0ms): "
+            f"n={len(all_ms)}, p50={statistics.median(all_ms):.0f}ms, p95={pct(all_ms, 0.95):.0f}ms"
+        )
+        if fired_ms:
+            body.append(
+                f"**Latencia cuando SÍ se ejecuta** (excluye primer-turno): n={len(fired_ms)}, "
+                f"p50={statistics.median(fired_ms):.0f}ms, p95={pct(fired_ms, 0.95):.0f}ms, "
+                f"min={min(fired_ms):.0f}ms, max={max(fired_ms):.0f}ms"
+            )
+        body.append("")
 
     text = "\n".join(header + body)
     out_path.write_text(text, encoding="utf-8")

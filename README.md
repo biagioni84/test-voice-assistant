@@ -212,6 +212,66 @@ conocido de modelos chicos hacia "seguir el tema" en vez de notar que cambió. N
 arreglar esto con prompting en un 3B; un modelo más grande (ver la sección de la Orin) maneja mejor la
 atención multi-turno.
 
+**SUPERADO (22/09)**: el fallback de sticky-hits de esta sección se eliminó por completo y se
+reemplazó por reescritura de consulta -- ver la siguiente sección. El diagnóstico con
+`--show-chunk-text` (ver más abajo) mostró que sticky-hits no era el problema real: el chunk
+correcto casi siempre se recuperaba bien, el problema era que la pregunta tal como la decía el
+usuario no era autónoma.
+
+## Reescritura de consulta (reemplaza a sticky-hits)
+
+Con las 5 variantes de `cambio_de_dia_en_followup` en `tests/eval_questions.yaml`, sticky-hits daba
+2/5 bien, 1/5 seguía hablando de domingo, y 2/5 abstenían de más (esas formulaciones de más de 4
+palabras no calificaban para el heurístico de "corto"). El diagnóstico con `--show-chunk-text`
+confirmó que el chunk correcto (con sábados *y* domingos) casi siempre llegaba bien al LLM -- el
+problema no era de retrieval, era que la pregunta tal como la dice el usuario ("Te pregunté el sábado
+a qué hora abre.") mezcla una frase meta ("te pregunté") con el dato real, y esa mezcla confundía
+tanto al retrieval como a la generación.
+
+**Cómo funciona ahora** (`voice/rewrite.py`, `voice/llm.py`):
+
+1. **Reescritura**: si hay historial (el primer turno de la charla no paga esto), una llamada extra
+   al mismo Qwen2.5-3B (`temperature=0`, `max_tokens=40`, mismo `logit_bias` anti-CJK) reescribe la
+   pregunta como autónoma, usando los últimos `rewrite.history_turns=2` turnos. Prompt + 5 ejemplos
+   few-shot (referencia simple, corrección explícita, cambio de tema total, meta-pregunta sobre el
+   asistente, y una continuación vacía tipo "y eso" que necesitó su propio ejemplo -- sin él, el
+   modelo devolvía basura tipo "y ahí" que no pasaba la validación).
+2. **Validación barata**: si la reescritura no termina en "?" o tiene más de 20 palabras, se usa la
+   pregunta original tal cual (probablemente no era una pregunta para reescribir -- charla social,
+   insultos, etc.).
+3. **Retrieval**: se hace *solo* con la pregunta reescrita. No hay más fallback de sticky-hits, no se
+   reusan chunks de turnos anteriores.
+4. **Abstención**: si la reescrita no supera el umbral, corta igual que antes (`voice/guardrails.py`),
+   pero con un mensaje distinto cuando hay historial: *"No lo encontré, ¿me lo preguntás de otra
+   forma?"* en vez del genérico *"No tengo información sobre eso."*
+5. **LLM de respuesta**: recibe *solo* la pregunta reescrita + el CONTEXTO de este turno -- ya **no
+   ve el historial de la charla en absoluto**. Antes recibía los últimos turnos además del CONTEXTO;
+   sacarlo evitó que el LLM se "ancle" en el tema de turnos anteriores (la causa original del bug).
+
+**Resultado** (`tests/eval_questions.yaml`, casos `type: rewrite` prueban solo el reescritor,
+aislado del resto):
+
+| Caso | Antes (sticky-hits) | Después (reescritura) |
+|---|---|---|
+| `cambio_de_dia_en_followup` (5 variantes) | 2/5 bien, 1/5 mal, 2/5 abstenían de más | **5/5** |
+| `followup_corto_mismo_tema`, `comentario_sin_tema_no_corta_continuidad` | pasaban | siguen pasando |
+| `identidad_inventada`, `_nombre_comun`, `chiste_generico` | 5/5, 3/3, 5/5 | sin regresión |
+| `retrieval_ambiguo_dos_docs` (bug de fidelidad al contexto, no tocado) | 0/3 | sigue 0/3, sin cambios (esperado) |
+
+**Costo**: la reescritura agrega una llamada al LLM por turno con historial. Medido con
+`scripts/eval.py`: quando corre de verdad, p50 ≈ 880ms, p95 ≈ 970ms (n=22 llamadas reales sobre 55
+turnos evaluados). El primer turno de cualquier charla no la paga (0ms, sin historial que reescribir).
+
+**Todavía no resuelto** (bug de "fidelidad al contexto", ver `retrieval_ambiguo_dos_docs` y
+`pregunta_compuesta` en `tests/eval_questions.yaml`): cuando el CONTEXTO mezcla información de dos
+documentos relacionados (horario de oficina + política de trabajo remoto), el modelo a veces inventa
+una política que combina mal las dos cosas, incluso con el chunk correcto presente. Este bug no
+depende del historial de la charla (pasa en preguntas de un solo turno), así que la reescritura no lo
+toca -- es un problema de capacidad del modelo al leer el CONTEXTO, no de qué pregunta se le hace.
+Próximos pasos, en orden: mejorar el chunking (separar hechos que hoy están mezclados en un mismo
+chunk) → un lookup estructurado de horarios en vez de texto libre → si nada de eso alcanza, un modelo
+más grande (7-8B o el MoE de la sección de la Orin).
+
 ## Testear el LLM/RAG con scripts/eval.py
 
 Herramienta de desarrollo (no de producción): corre una lista de casos de prueba contra el LLM/RAG real
@@ -228,7 +288,12 @@ nuevos (cada caso tiene `note`/`expect` explicando qué prueba y por qué). Sopo
 varias formulaciones distintas de la misma pregunta, para medir robustez a *cómo* se pregunta. Con
 `temperature=0` (ver `[llm]` en `config.toml`) la generación es determinística, así que repetir
 literalmente la misma pregunta ya no aporta nada — por eso `variants` reemplazó a un viejo `repeat: N`
-que medía ruido de muestreo en vez de robustez real.
+que medía ruido de muestreo en vez de robustez real. También soporta `type: rewrite`: casos que prueban
+*solo* `voice/rewrite.py` aislado (historial + pregunta → pregunta autónoma esperada), sin pasar por
+RAG ni el LLM de respuesta — útil para saber si un fallo es de la reescritura o de lo que pasa después.
+`--show-chunk-text` muestra el texto completo de cada chunk recuperado (no solo `source@score`), y al
+final de la corrida se reporta la latencia de la reescritura (p50/p95, con y sin contar los turnos que
+no la disparan por no tener historial todavía).
 
 **Guardrails deterministas** (`voice/guardrails.py`, no dependen de que el LLM "decida" seguir una
 instrucción):

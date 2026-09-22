@@ -64,8 +64,16 @@ class LlmCfg:
     max_tokens: int = 200
     temperature: float = 0.0  # 0 = greedy/determinístico; con >0 la misma conversación puede dar
                                # resultados distintos entre corridas (ver README, tests/eval_questions.yaml)
-    history_turns: int = 4
     system_prompt: str = "Eres un asistente de voz. Responde en español, breve."
+    # OJO: el LLM de respuesta ya NO recibe el historial de la charla (ver voice/rewrite.py) -- por
+    # eso no hay un "history_turns" acá; el que le llega al reescritor está en [rewrite].
+
+
+@dataclass
+class RewriteCfg:
+    enabled: bool = True
+    history_turns: int = 2   # últimos N turnos (usuario+asistente) que ve el reescritor
+    max_tokens: int = 40
 
 
 @dataclass
@@ -83,6 +91,7 @@ class Config:
     stt: SttCfg
     rag: RagCfg
     llm: LlmCfg
+    rewrite: RewriteCfg
     tts: TtsCfg
 
 
