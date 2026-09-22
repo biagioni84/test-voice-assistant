@@ -163,6 +163,55 @@ ese caso de uso probablemente no necesita más "inteligencia" que la que ya da u
 sí se nota en cada intercambio hablado. Antes de fijar el default, correr `scripts/bench.py` con ambos
 en la Orin real y comparar en preguntas típicas del RAG.
 
+## Bug real: el RAG perdía contexto en follow-ups cortos
+
+Probando con micrófono real (no con las preguntas fijas de `bench.py`) apareció esto en una
+conversación real:
+
+```
+🗣 ¿A qué hora abre la oficina el domingo?  → "no abre el domingo" ✓
+🗣 y eso                                     → "no abre el domingo" ✓ (pero por casualidad)
+🗣 Te pregunté el sábado a qué hora abre.    → "La oficina no abre los sábados" ✗ (falso)
+🗣 ¿Cómo que no abre los sábados?            → "abre de 10 a 1 los sábados" ✓ (se contradice a sí mismo)
+```
+
+**Causa raíz** (confirmada recuperando estas queries a mano contra el índice): un follow-up corto como
+`"y eso"` o `"y los sábados"` embebido *solo* no trae señal suficiente — el coseno contra el chunk
+correcto queda debajo de `min_score` y no se inyecta ningún CONTEXTO. Sin contexto fresco, el LLM
+improvisa con lo que dijo antes en la charla (que puede ser incorrecto) en vez de admitir que no sabe.
+Un segundo problema, más sutil: un doc apenas relacionado (`soporte_tecnico.md` a 0.33 para "¿por qué
+demoras tanto en responder?") a veces pasaba el umbral y el modelo intentaba forzarlo igual.
+
+**Fix** (`voice/pipeline.py: Assistant._retrieve_sticky`): se prueba primero la pregunta sola contra el
+índice. Si no trae nada **y** es corta (≤4 palabras — heurístico para distinguir un follow-up tipo "y
+los sábados" de una pregunta completa que simplemente no tiene doc relacionado), se reusan **los hits
+tal cual del último turno que sí tuvo contexto** — sin reconstruir una query combinada ni volver a
+embeder nada. Guardar los `Hit` ya resueltos (no la pregunta) en vez de "la pregunta anterior" importa:
+si el turno inmediatamente anterior fue en sí mismo un comentario sin tema (p.ej. "¿por qué demoras
+tanto?"), ese turno no pisa el "último contexto bueno" — así un comentario de paso en medio de la
+conversación no corta la continuidad del tema real. También se subió `min_score` a 0.35 (filtra matches
+débiles como el de soporte_tecnico.md) y se reforzó el `system_prompt` para que el CONTEXTO gane siempre
+por sobre lo que el propio modelo dijo antes, y para que ignore CONTEXTO que no tenga que ver con la
+pregunta en vez de forzarlo.
+
+Con esto, la misma conversación:
+
+```
+🗣 ¿A qué hora abre la oficina el domingo?  → "no abre el domingo" ✓
+🗣 y eso                                     → "no abre el domingo" ✓ (ahora por contexto heredado, no azar)
+🗣 Te pregunté el sábado a qué hora abre.    → "abre a las 10 de la mañana los sábados" ✓
+🗣 ¿Por qué demoras tanto en responder?      → sin contexto (correcto, no hay doc relacionado)
+🗣 y los sábados                             → "los sábados abre de diez a una de la tarde" ✓ (recuperó
+                                                el tema real, saltando el comentario sin tema del medio)
+```
+
+**Límite que queda, y no es un bug de RAG**: en el turno de "¿por qué demoras tanto en responder?", el
+LLM (3B) a veces igual menciona el horario de la oficina aunque no se le haya dado ningún CONTEXTO ese
+turno — lo arrastra de su propio historial de charla por pura continuidad conversacional, un sesgo
+conocido de modelos chicos hacia "seguir el tema" en vez de notar que cambió. No hay mucho margen para
+arreglar esto con prompting en un 3B; un modelo más grande (ver la sección de la Orin) maneja mejor la
+atención multi-turno.
+
 ## Estructura
 
 ```

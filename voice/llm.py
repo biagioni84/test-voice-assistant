@@ -25,7 +25,9 @@ class LocalLLM:
 
     def stream_reply(self, question: str, context: str | None = None) -> Iterator[str]:
         """Genera tokens en streaming. El contexto RAG va solo en este turno, no en el historial."""
-        user = f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}" if context else question
+        # el "PREGUNTA A RESPONDER AHORA" (en vez de solo "PREGUNTA") ayuda a que modelos chicos no
+        # se anclen en el tema de los turnos anteriores del historial cuando la pregunta cambia de tema
+        user = f"CONTEXTO:\n{context}\n\nPREGUNTA A RESPONDER AHORA (ignorá de qué hablaban los turnos anteriores si esta pregunta es sobre otra cosa): {question}" if context else question
         messages = [
             {"role": "system", "content": self.cfg.system_prompt},
             *self.history[-2 * self.cfg.history_turns :],

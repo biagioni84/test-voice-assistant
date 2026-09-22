@@ -55,6 +55,7 @@ class Assistant:
         self.vad = UtteranceRecorder(cfg.vad, cfg.audio.sample_rate)
         self.wake = WakeWord(cfg.wakeword) if cfg.wakeword.enabled else None
         self.mic = Mic(cfg.audio.sample_rate, cfg.audio.mic_name)
+        self._sticky_hits: list = []  # últimos hits de RAG que SÍ tuvieron contexto (ver _retrieve_sticky)
 
     # ---- un turno: audio -> texto -> respuesta hablada -------------------------------------
     def transcribe(self, audio: np.ndarray) -> tuple[str, float]:
@@ -62,12 +63,30 @@ class Assistant:
         text = self.stt.transcribe(audio)
         return text, time.monotonic() - t
 
+    _FOLLOWUP_MAX_WORDS = 4  # "y eso", "y los sábados", "¿y los sábados?" caen acá; una pregunta
+                              # completa que simplemente no tiene doc relacionado, no
+
+    def _retrieve_sticky(self, question: str) -> list:
+        """Recupera con la pregunta sola. Si no trae nada Y la pregunta es corta (probable follow-up
+        tipo "y los sábados", que no trae señal suficiente para el embedding solo — ver README), reusa
+        los hits del último turno que sí tuvo contexto, tal cual (sin reconstruir una query combinada:
+        eso es lo que causaba el bug de "expandir con el tema equivocado" cuando el turno inmediatamente
+        anterior era en sí mismo un comentario casual sin tema). Un turno largo sin hits no hereda nada
+        (probablemente no hay doc relacionado) y tampoco borra lo heredable para el próximo turno corto
+        — así un comentario de paso entre dos preguntas del mismo tema no corta la continuidad."""
+        hits = self.rag.retrieve(question)
+        if not hits and len(question.split()) <= self._FOLLOWUP_MAX_WORDS:
+            hits = self._sticky_hits
+        if hits:
+            self._sticky_hits = hits
+        return hits
+
     def answer(self, question: str, t_user_done: float | None = None) -> Turn:
         turn = Turn(question=question)
         t0 = t_user_done or time.monotonic()
 
         t = time.monotonic()
-        hits = self.rag.retrieve(question) if self.rag else []
+        hits = self._retrieve_sticky(question) if self.rag else []
         turn.t_rag = time.monotonic() - t
         turn.context_hits = hits
         context = Retriever.format_context(hits) if hits else None

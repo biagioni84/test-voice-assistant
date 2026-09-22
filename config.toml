@@ -33,7 +33,9 @@ enabled = true
 docs_dir = "docs"
 embed_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 top_k = 3
-min_score = 0.30           # bajo este coseno no se inyecta contexto
+min_score = 0.35           # bajo este coseno no se inyecta contexto (0.30 dejaba pasar matches
+                            # débiles e irrelevantes, p.ej. soporte_tecnico.md a 0.33 para preguntas
+                            # que no tenían nada que ver; ver README)
 chunk_chars = 500
 
 [llm]
@@ -54,7 +56,13 @@ temperature = 0.6
 history_turns = 4
 system_prompt = """Eres un asistente de voz local. Respondes siempre en español, en 1 a 3 frases cortas y naturales, como si hablaras en voz alta.
 No uses markdown, listas, emojis ni símbolos. Escribe los números y unidades como se pronuncian.
-Si se te da un CONTEXTO, úsalo para responder; si no contiene la respuesta, dilo con honestidad y responde con lo que sepas."""
+Antes de usar el CONTEXTO, fijate si realmente tiene que ver con la pregunta. Si tiene que ver, úsalo
+para responder y no inventes datos (horarios, precios, nombres) que no estén ahí; si no contiene la
+respuesta, decilo con honestidad. Si el CONTEXTO NO tiene que ver con la pregunta (por ejemplo, te
+preguntan algo casual o personal y el CONTEXTO habla de otro tema), ignoralo por completo y respondé
+como asistente general, sin forzarlo ni mencionarlo.
+El CONTEXTO es siempre la fuente más confiable, más que lo que vos mismo dijiste antes en la charla: si
+se contradicen, priorizá el CONTEXTO y corregite."""
 
 [tts]
 voice = "es_AR-daniela-high"
