@@ -57,6 +57,12 @@ class Assistant:
         self.mic = Mic(cfg.audio.sample_rate, cfg.audio.mic_name)
         self._sticky_hits: list = []  # últimos hits de RAG que SÍ tuvieron contexto (ver _retrieve_sticky)
 
+    def reset_conversation(self) -> None:
+        """Arranca una charla nueva: limpia historial del LLM y el contexto RAG heredado (usado por
+        scripts/eval.py entre casos de prueba, para que uno no contamine al siguiente)."""
+        self.llm.reset()
+        self._sticky_hits = []
+
     # ---- un turno: audio -> texto -> respuesta hablada -------------------------------------
     def transcribe(self, audio: np.ndarray) -> tuple[str, float]:
         t = time.monotonic()

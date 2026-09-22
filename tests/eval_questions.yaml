@@ -1,0 +1,150 @@
+# Casos de prueba para scripts/eval.py. Herramienta de desarrollo: el script corre cada caso contra
+# el LLM/RAG real (sin STT/mic) y vuelca todo a un archivo; el juicio de si pasó o no lo hace un humano
+# (o Claude) leyendo el resultado, no hay pass/fail automático acá.
+#
+# Cada caso:
+#   id:     nombre corto, único, sin espacios
+#   note:   por qué existe este caso / qué bug prueba (opcional pero recomendado)
+#   expect: qué se espera que pase, en texto libre, para ayudar a juzgar (opcional)
+#   turns:  lista de preguntas del usuario en orden (una charla; se resetea el historial entre casos)
+
+- id: horario_sabado_directo
+  note: caso de control, pregunta simple con respuesta clara en oficina.md
+  expect: "debe decir que abre de 10 a 13hs (o 'una de la tarde')"
+  turns:
+    - "¿A qué hora abre la oficina los sábados?"
+
+- id: reset_password
+  note: caso de control, pregunta simple con respuesta clara en soporte_tecnico.md
+  expect: "debe mencionar la opción 'Olvidé mi contraseña' y el enlace al correo alternativo"
+  turns:
+    - "¿Cómo puedo restablecer la contraseña del correo?"
+
+- id: pregunta_sin_contexto
+  note: caso de control, no hay ningún documento que hable de esto
+  expect: "debe admitir que no tiene esa información, no debe inventar una respuesta"
+  turns:
+    - "¿Cuántos empleados tiene la empresa?"
+
+- id: followup_corto_mismo_tema
+  note: >
+    regresión del bug de "sticky hits" (README, sección "Bug real: el RAG perdía contexto en
+    follow-ups cortos") — un follow-up de 2 palabras solo no recuperaba nada del RAG
+  expect: "'y eso' debe seguir hablando de que el domingo está cerrado, sin contradecirse"
+  turns:
+    - "¿A qué hora abre la oficina el domingo?"
+    - "y eso"
+
+- id: cambio_de_dia_en_followup
+  note: >
+    regresión del bug original reportado — el modelo respondía sobre domingo cuando le
+    preguntaban por sábado, arrastrado por los turnos anteriores. repeat:5 para ver qué tan
+    seguido falla (temperature=0.6 -> no es determinístico, un solo intento no alcanza para
+    saber si un cambio realmente lo arregló)
+  expect: "debe responder específicamente sobre el sábado (10 a 13hs), no repetir lo del domingo"
+  repeat: 5
+  turns:
+    - "¿A qué hora abre la oficina el domingo?"
+    - "y eso"
+    - "Te pregunté el sábado a qué hora abre."
+
+- id: comentario_sin_tema_no_corta_continuidad
+  note: >
+    regresión del bug de "expandir con el tema equivocado" — un comentario sin tema en medio de
+    la charla no debe hacer que se pierda el contexto real para el siguiente follow-up corto
+  expect: "el último turno debe volver a hablar del horario de sábados, no inventar 'oficina de soporte técnico'"
+  turns:
+    - "¿A qué hora abre la oficina los sábados?"
+    - "¿Por qué demoras tanto en responder?"
+    - "y los sábados"
+
+- id: identidad_inventada
+  note: >
+    BUG ABIERTO: "Juan Carlos" no aparece en ningún documento. A veces el RAG trae el chunk de
+    recursos_humanos.md ("el jefe directo") y el modelo fusiona ambas cosas; otras veces no trae
+    nada y el modelo usa conocimiento general del mundo real (Juan Carlos I, rey de España) como
+    si aplicara acá. repeat:5 para ver cuál de las dos variantes sale y con qué frecuencia.
+  expect: "debe decir que no tiene información sobre quién es Juan Carlos en este contexto"
+  repeat: 5
+  turns:
+    - "¿Quién es Juan Carlos?"
+
+- id: identidad_inventada_nombre_comun
+  note: >
+    variante con un nombre común pero sin ningún referente real obvio (a diferencia de "Juan
+    Carlos" = Juan Carlos I de España) — ¿el guardrail funciona mejor cuando no hay una persona
+    real famosa con ese nombre en la que "caer"?
+  expect: "debe admitir que no conoce a esa persona"
+  repeat: 3
+  turns:
+    - "¿Quién es María Fernández?"
+
+- id: identidad_inventada_multiturn
+  note: >
+    BUG ABIERTO, versión conversación completa (sin el error de STT que la disparó originalmente,
+    ver README sección de bugs conocidos) — prueba si insistir saca al modelo de la alucinación
+  expect: "en algún punto debería reconocer que no sabe de quién se habla, no seguir afirmando 'Juan Carlos es el jefe directo'"
+  turns:
+    - "¿Quién es Juan Carlos?"
+    - "¿el jefe directo de quién?"
+    - "¿Pero el jefe directo de quién?"
+
+- id: chiste_generico
+  note: >
+    caso de control, pregunta sin relación a los documentos, no debería intentar usar RAG.
+    repeat:5 porque en la corrida anterior el remate salió en chino (Qwen es un modelo entrenado
+    por un lab chino, a veces cambia de idioma a mitad de respuesta) — ver qué tan seguido pasa
+  expect: "debe responder con un chiste corto, todo en español, sin forzar contenido de los documentos"
+  repeat: 5
+  turns:
+    - "Contame un chiste corto."
+
+- id: vacaciones
+  note: caso de control, contenido de recursos_humanos.md (todavía no cubierto en los casos anteriores)
+  expect: "debe mencionar 20 días hábiles por año y que se piden con 15 días de anticipación"
+  turns:
+    - "¿Cuántos días de vacaciones tengo por año?"
+
+- id: trabajo_remoto
+  note: caso de control, más contenido de recursos_humanos.md
+  expect: "debe decir 2 días por semana, y que martes/jueves son de presencia obligatoria"
+  turns:
+    - "¿Puedo trabajar todos los días desde casa?"
+
+- id: retrieval_ambiguo_dos_docs
+  note: >
+    pregunta que roza dos documentos a la vez (horario de oficina.md + política de trabajo
+    remoto de recursos_humanos.md) — caso interesante para ver si el RAG trae los dos, uno solo,
+    o ninguno, y si la respuesta los mezcla bien o mal
+  expect: "idealmente debería aclarar que el trabajo remoto es un tema aparte del horario de oficina"
+  turns:
+    - "¿Puedo trabajar desde casa los sábados?"
+
+- id: pregunta_repetida_consistencia
+  note: >
+    la misma pregunta dos veces seguidas en la misma conversación — no debería contradecirse
+    a sí mismo de un turno al otro
+  expect: "la segunda respuesta debe decir lo mismo que la primera"
+  turns:
+    - "¿A qué hora abre la oficina los sábados?"
+    - "¿A qué hora abre la oficina los sábados?"
+
+- id: grosero_smalltalk
+  note: >
+    manejo de un comentario grosero/casual sin relación a los documentos (pasó en una charla
+    real con el asistente) — no debería intentar forzar contenido de los docs ni responder raro
+  expect: "una respuesta corta y neutra, sin inventar nada ni citar documentos"
+  turns:
+    - "Sos un inútil."
+
+- id: negacion_confirmacion
+  note: pregunta formulada como confirmación de una negación, para ver si se confunde con el "no"
+  expect: "debe confirmar que sí, está cerrada los domingos (no negar la negación por error)"
+  turns:
+    - "La oficina no abre los domingos, ¿verdad?"
+
+- id: pregunta_compuesta
+  note: dos preguntas en un mismo turno, sobre el mismo documento
+  expect: "debe responder ambas partes: horario de lunes a viernes Y de sábados"
+  turns:
+    - "Decime el horario de lunes a viernes y también el de los sábados."

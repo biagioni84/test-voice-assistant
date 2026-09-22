@@ -3,3 +3,4 @@ models/
 .cache/
 __pycache__/
 *.pyc
+eval_results/

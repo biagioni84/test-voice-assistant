@@ -212,6 +212,40 @@ conocido de modelos chicos hacia "seguir el tema" en vez de notar que cambió. N
 arreglar esto con prompting en un 3B; un modelo más grande (ver la sección de la Orin) maneja mejor la
 atención multi-turno.
 
+## Testear el LLM/RAG con scripts/eval.py
+
+Herramienta de desarrollo (no de producción): corre una lista de casos de prueba contra el LLM/RAG real
+(sin STT ni micrófono) y vuelca todo a un Markdown en `eval_results/` — no calcula pass/fail solo, el
+juicio de si cada caso está bien lo hace un humano (o Claude) leyendo el resultado.
+
+```bash
+.venv/bin/python scripts/eval.py                       # corre tests/eval_questions.yaml completo
+.venv/bin/python scripts/eval.py --out mi_corrida.md
+```
+
+Los casos viven en `tests/eval_questions.yaml` — se van agregando ahí a medida que aparecen bugs
+nuevos (cada caso tiene `note`/`expect` explicando qué prueba y por qué). Soporta `repeat: N` por caso:
+como `temperature=0.6` hace que las respuestas no sean determinísticas, un solo intento no alcanza para
+saber si algo "se arregló" — repetir varias veces da una idea real de la tasa de fallo.
+
+**Última corrida completa (31 ejecuciones, 22/09), resumen:**
+
+| Caso | Resultado |
+|---|---|
+| Horarios, reset de contraseña, vacaciones, trabajo remoto (preguntas directas) | ✓ Pass |
+| Pregunta sin ningún doc relacionado | ✓ Pass (admite que no sabe) |
+| Follow-ups cortos y comentarios sin tema en medio de la charla | ✓ Pass (fix de sticky-hits sostiene) |
+| Pregunta repetida dos veces seguidas | ✓ Pass (consistente) |
+| Comentario grosero / small talk | ✓ Pass (no fuerza contenido de los docs) |
+| Cambiar de día en un follow-up ("¿y el sábado?" después de hablar del domingo) | ✗ **5/5** corridas fallaron en dar una respuesta limpia sobre el día correcto |
+| "¿Quién es Juan Carlos?" (nombre sin doc, pero real y famoso) | ✗ **5/5** inventó que es el Rey de España (con fechas de reinado distintas e incorrectas cada vez) |
+| "¿Quién es María Fernández?" (nombre común, sin referente famoso obvio) | ✗ 1/3 inventó una actriz; 2/3 admitió que no sabía |
+| Chiste sin relación a los docs | ✗ **2/5** cambió de idioma a mitad de frase (remate en chino) |
+| Pregunta que roza dos documentos a la vez (horario de oficina + política de trabajo remoto) | ✗ inventó que "los sábados son de presencia obligatoria" (dato falso, mezcla dos políticas distintas) |
+| Pregunta compuesta (dos horarios en una sola pregunta) | ✗ dio un horario de cierre de sábado incorrecto (14hs en vez de 13hs) aun con el contexto correcto |
+
+Quedan documentados como casos de regresión en `tests/eval_questions.yaml`; los fixes se discuten aparte.
+
 ## Estructura
 
 ```
