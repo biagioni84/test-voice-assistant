@@ -21,28 +21,36 @@ class Hit:
     text: str
 
 
+def _extract_title(text: str) -> tuple[str, str]:
+    """Si la primera línea es un heading markdown ("# Título (lo que sea)"), la separa del resto y
+    devuelve (título corto, texto sin el heading). Si no hay heading, título vacío."""
+    first, _, rest = text.partition("\n")
+    if first.startswith("# "):
+        title = first[2:].split("(")[0].strip()
+        return title, rest.strip()
+    return "", text
+
+
 def _chunk(text: str, max_chars: int) -> list[str]:
-    """Junta párrafos consecutivos hasta max_chars; párrafos gigantes se cortan por oraciones."""
+    """Un chunk por párrafo (separado por línea en blanco) -- a propósito NO se combinan párrafos
+    distintos aunque entren juntos en max_chars, para no mezclar hechos sin relación en un mismo
+    chunk (p.ej. horario de oficina + wifi, ver README). Un párrafo que por sí solo supere max_chars
+    se corta por oraciones."""
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks, cur = [], ""
+    chunks = []
     for p in paras:
-        if len(p) > max_chars:
-            pieces, buf = [], ""
-            for sent in p.replace("\n", " ").split(". "):
-                if buf and len(buf) + len(sent) > max_chars:
-                    pieces.append(buf)
-                    buf = ""
-                buf += sent + ". "
+        if len(p) <= max_chars:
+            chunks.append(p)
+            continue
+        pieces, buf = [], ""
+        for sent in p.replace("\n", " ").split(". "):
+            if buf and len(buf) + len(sent) > max_chars:
+                pieces.append(buf.strip())
+                buf = ""
+            buf += sent + ". "
+        if buf.strip():
             pieces.append(buf.strip())
-        else:
-            pieces = [p]
-        for piece in pieces:
-            if cur and len(cur) + len(piece) > max_chars:
-                chunks.append(cur)
-                cur = ""
-            cur = f"{cur}\n{piece}".strip()
-    if cur:
-        chunks.append(cur)
+        chunks.extend(pieces)
     return chunks
 
 
@@ -64,8 +72,10 @@ class Retriever:
         docs_dir = resolve(self.cfg.docs_dir)
         files = sorted(p for p in docs_dir.glob("**/*") if p.suffix in (".md", ".txt"))
         for f in files:
-            for c in _chunk(f.read_text(encoding="utf-8"), self.cfg.chunk_chars):
-                self.chunks.append((f.relative_to(docs_dir).as_posix(), c))
+            title, body = _extract_title(f.read_text(encoding="utf-8"))
+            for c in _chunk(body, self.cfg.chunk_chars):
+                text = f"{title}: {c}" if title else c
+                self.chunks.append((f.relative_to(docs_dir).as_posix(), text))
         if not self.chunks:
             return
 

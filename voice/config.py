@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +52,8 @@ class RagCfg:
     top_k: int = 3
     min_score: float = 0.30
     chunk_chars: int = 500
+    ambiguity_threshold: float = 0.08  # ver voice/guardrails.py: ambiguous_docs()
+    doc_topics: dict = field(default_factory=dict)  # "archivo.md" -> "nombre de tema" para el gate
 
 
 @dataclass

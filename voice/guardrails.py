@@ -50,6 +50,35 @@ def abstain_reply(question: str, has_history: bool = False) -> str:
     return "No tengo información sobre eso."
 
 
+def ambiguous_docs(hits: list, threshold: float) -> tuple[str, str] | None:
+    """Si los dos documentos DISTINTOS con mejor score (no necesariamente los hits en posición 1 y
+    2 -- si el top-2 son del mismo doc, se ignoran entre sí y se compara contra el mejor de otro
+    doc) están a menos de `threshold` de diferencia, devuelve (doc1, doc2) para pedir aclaración en
+    vez de generar. Si no hay ambigüedad (o hay un solo doc representado), None.
+
+    No cubre todos los casos de "el modelo mezcla mal el CONTEXTO" -- solo el patrón específico de
+    dos documentos con evidencia comparable. Si un solo doc tiene un match débil-pero-por-encima-
+    del-umbral y el modelo igual alucina con él, esto no lo agarra (ver README, caso
+    retrieval_ambiguo_dos_docs variante 1)."""
+    best_per_doc: dict[str, float] = {}
+    for h in hits:
+        best_per_doc[h.source] = max(best_per_doc.get(h.source, 0.0), h.score)
+    ranked = sorted(best_per_doc.items(), key=lambda kv: -kv[1])
+    if len(ranked) < 2:
+        return None
+    (doc1, s1), (doc2, s2) = ranked[0], ranked[1]
+    if s1 - s2 < threshold:
+        return doc1, doc2
+    return None
+
+
+def clarify_reply(doc1: str, doc2: str, doc_topics: dict[str, str]) -> str:
+    """Pregunta de aclaración nombrando los dos temas en juego (ver ambiguous_docs)."""
+    t1 = doc_topics.get(doc1, doc1)
+    t2 = doc_topics.get(doc2, doc2)
+    return f"Tu pregunta toca dos temas distintos: {t1} y {t2}. ¿Sobre cuál de los dos te referís?"
+
+
 def cjk_token_bias(llm, value: float = -100.0) -> dict[int, float]:
     """logit_bias que castiga cada token del vocabulario que contenga caracteres CJK, para que el
     modelo prácticamente nunca los elija -- prevenir en el muestreo en vez de detectar y reintentar

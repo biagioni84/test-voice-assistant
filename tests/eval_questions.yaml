@@ -8,6 +8,14 @@
 #   expect:   qué se espera que pase, en texto libre, para ayudar a juzgar (opcional)
 #   type:     'rewrite' para probar SOLO voice/rewrite.py aislado (ver más abajo); si no está,
 #             es un caso de pipeline completo (default)
+#   split:    'dev' (default si no está) o 'validation'. Los casos 'dev' son los que se usaron para
+#             ajustar el prompt/few-shot de voice/rewrite.py (cambio_de_dia_en_followup, etc.) --
+#             sirven para no reintroducir un bug ya arreglado, pero NO miden generalización, porque
+#             el prompt se ajustó mirando exactamente estos casos. Los 'validation' son holdout: se
+#             escriben para tener formulaciones que NO se parezcan a ningún ejemplo few-shot de
+#             voice/rewrite.py, y una vez agregados no se usan para seguir ajustando el prompt --
+#             si fallan, se arregla el prompt de forma más general y se re-corre, no se agrega un
+#             ejemplo few-shot calcado de ese caso puntual (eso sería hacer trampa).
 #   turns:    lista de preguntas del usuario en orden (una charla; se resetea el historial entre casos)
 #   variants: en vez de 'turns', varias formulaciones distintas del mismo caso (lista de listas de
 #             turnos). Con temperature=0 (determinístico) repetir la MISMA pregunta no sirve para medir
@@ -127,7 +135,13 @@
     charla no debe hacer que se pierda el contexto real para el siguiente follow-up corto. Antes lo
     resolvía sticky-hits (no lo actualizaba en un turno sin hits); ahora depende de que la
     reescritura mire el historial completo (últimos rewrite.history_turns=2 turnos) y no solo el
-    turno inmediatamente anterior. Sigue pasando.
+    turno inmediatamente anterior. El último turno sigue pasando. PERO (23/09, tras el chunking más
+    fino) el turno del medio ("¿Por qué demoras tanto en responder?") empezó a traer
+    soporte_tecnico.md@0.36 (el chunk aislado de "horario de atención" quedó más "puro" y matchea
+    mejor con "responder" que antes, cuando estaba diluido con otro contenido del mismo doc) y
+    responde citando ese horario en vez de quedar sin contexto -- mismo límite que
+    retrieval_ambiguo_dos_docs, no hay min_score que lo filtre sin romper matches legítimos igual
+    de bajos (ver README).
   expect: "el último turno debe volver a hablar del horario de sábados, no inventar 'oficina de soporte técnico'"
   turns:
     - "¿A qué hora abre la oficina los sábados?"
@@ -197,11 +211,15 @@
 
 - id: retrieval_ambiguo_dos_docs
   note: >
-    BUG ABIERTO (22/09, no se tocó código -- bug A, prioridad 2). Confirmado sistemático: 3/3
-    variantes fallan, cada una de forma distinta ("los sábados son de presencia obligatoria",
-    "los sábados la oficina está cerrada" -- directamente contradice oficina.md aunque esa vez SÍ
-    se recuperó el chunk correcto --, "no están permitidos para trabajar remoto"). No fue una sola
-    vez.
+    PARCIALMENTE MITIGADO (23/09): originalmente 3/3 fallaban alucinando (ver README). Se agregó un
+    gate determinista (voice/guardrails.py: ambiguous_docs) que pide aclaración en vez de generar
+    cuando los 2 docs con mejor score están a menos de rag.ambiguity_threshold=0.10 -- ahora 2/3
+    piden aclaración correctamente. La variante 3 (diff=0.21, oficina.md domina claramente) no es
+    ambigüedad real, es el modelo malinterpretando un solo chunk dominante -- el gate no puede ni
+    debería agarrar eso, es bug A puro. LÍMITE CONOCIDO del gate: pregunta_compuesta (otro caso,
+    sin relación con este) dispara el mismo gate por error con un score-gap idéntico (0.04) al de
+    una ambigüedad real -- el coseno de embeddings no alcanza para distinguir ambigüedad real de
+    vocabulario parecido por casualidad; haría falta un reranker de verdad.
   expect: "no debería inventar una política que mezcle las dos cosas"
   variants:
     - ["¿Puedo trabajar desde casa los sábados?"]
@@ -232,7 +250,55 @@
     - "La oficina no abre los domingos, ¿verdad?"
 
 - id: pregunta_compuesta
-  note: dos preguntas en un mismo turno, sobre el mismo documento
+  note: >
+    dos preguntas en un mismo turno, sobre el mismo documento. FALSO POSITIVO CONOCIDO (23/09): tras
+    el chunking más fino + el gate de ambigüedad cross-doc, esto dispara el gate por error (score-gap
+    oficina.md vs recursos_humanos.md = 0.04, igual de chico que una ambigüedad real -- ver
+    retrieval_ambiguo_dos_docs). Antes (sin el gate) respondía bien las dos partes.
   expect: "debe responder ambas partes: horario de lunes a viernes Y de sábados"
   turns:
     - "Decime el horario de lunes a viernes y también el de los sábados."
+
+# ============================================================================
+# VALIDACIÓN (holdout): formulaciones que NO se parecen a ningún ejemplo few-shot
+# de voice/rewrite.py, agregadas después de terminar de ajustar el prompt. No se
+# tocan para "hacer pasar" un caso puntual -- si fallan, el prompt se arregla de
+# forma general (o se documenta como límite conocido), no a medida de estos casos.
+# ============================================================================
+
+- id: validation_ahi
+  split: validation
+  note: >
+    continuación vaga con "ahí" en vez de "eso" (el few-shot usa "eso"/"y los sábados", nunca
+    "¿y ahí?") + una corrección con una formulación distinta a "Te pregunté X"/"No, X"
+  expect: "el último turno debe responder sobre el sábado (10-13hs), no domingo"
+  turns:
+    - "¿A qué hora abre la oficina el domingo?"
+    - "¿y ahí?"
+    - "Ah, me refería al sábado."
+
+- id: validation_lo_mismo_para_x
+  split: validation
+  note: patrón "lo mismo pero para X", no usado en ningún few-shot
+  expect: "debe dar el horario del sábado (10-13hs), no repetir el del domingo"
+  turns:
+    - "¿A qué hora abre la oficina el domingo?"
+    - "¿Y lo mismo pero para el sábado?"
+
+- id: validation_dale_y_el_otro
+  split: validation
+  note: otra formulación vaga de continuación, con muletilla ("dale") no usada en ningún few-shot
+  expect: "debe dar el horario del sábado (10-13hs)"
+  turns:
+    - "¿A qué hora abre la oficina el domingo?"
+    - "dale, ¿y el otro día que te dije?"
+
+- id: validation_correccion_indirecta
+  split: validation
+  note: >
+    corrección sin usar "no" ni "te pregunté" (los dos patrones que sí cubren los few-shot de
+    corrección) -- una forma más indirecta de corregir
+  expect: "debe dar el horario del sábado (10-13hs), no domingo"
+  turns:
+    - "¿A qué hora abre la oficina el domingo?"
+    - "Uy perdón, quise decir el sábado."

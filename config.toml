@@ -32,11 +32,24 @@ beam_size = 1
 enabled = true
 docs_dir = "docs"
 embed_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-top_k = 3
+top_k = 2
 min_score = 0.35           # bajo este coseno no se inyecta contexto (0.30 dejaba pasar matches
                             # débiles e irrelevantes, p.ej. soporte_tecnico.md a 0.33 para preguntas
                             # que no tenían nada que ver; ver README)
-chunk_chars = 500
+chunk_chars = 500           # tope para partir un párrafo gigante; NO se usa para combinar párrafos
+                            # distintos entre sí (un chunk = un párrafo = un hecho, ver README)
+ambiguity_threshold = 0.10  # si los 2 docs con mejor score están a menos que esto, se pide
+                            # aclaración en vez de generar. LÍMITE CONOCIDO (ver README): el score de
+                            # coseno no distingue "la pregunta toca 2 temas de verdad" de "un chunk
+                            # sin relación tiene vocabulario parecido por casualidad" -- pregunta_compuesta
+                            # dispara el gate con un gap (0.04) idéntico al de un caso de ambigüedad
+                            # real. Ningún umbral separa limpiamente ambos casos con esta señal sola;
+                            # haría falta un reranker de verdad (no tenemos uno) para hacerlo bien.
+
+[rag.doc_topics]            # nombres de tema para el mensaje de aclaración del gate de ambigüedad
+"oficina.md" = "horarios y logística de oficina"
+"recursos_humanos.md" = "políticas de RR.HH."
+"soporte_tecnico.md" = "soporte técnico"
 
 [llm]
 # Medido con scripts/bench.py en esta máquina (llama-cpp-python COMPILADO con CUDA, ver README):

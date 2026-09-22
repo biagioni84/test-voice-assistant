@@ -8,7 +8,7 @@ import numpy as np
 
 from .audio import Mic, Speaker
 from .config import Config
-from .guardrails import abstain_reply, is_chitchat
+from .guardrails import abstain_reply, ambiguous_docs, clarify_reply, is_chitchat
 from .llm import LocalLLM
 from .rag import Retriever
 from .stt import Transcriber
@@ -71,11 +71,11 @@ class Assistant:
         text = self.stt.transcribe(audio)
         return text, time.monotonic() - t
 
-    def _abstain(self, question: str, turn: Turn, t0: float, has_history: bool) -> Turn:
-        """Corta acá sin llamar al LLM de respuesta (ver voice/guardrails.py): sin esto, "responder
-        como asistente general" era justo lo que llevaba a inventar identidades (bug 'Juan Carlos es
-        el Rey de España', ver README)."""
-        answer_text = abstain_reply(turn.retrieval_query, has_history)
+    def _fixed_reply(self, question: str, answer_text: str, turn: Turn, t0: float) -> Turn:
+        """Corta acá sin llamar al LLM de respuesta (ver voice/guardrails.py): usado tanto para la
+        abstención (sin CONTEXTO) como para el gate de ambigüedad cross-doc (dos documentos con
+        evidencia comparable). Sin esto, "responder como asistente general" era justo lo que llevaba
+        a inventar identidades (bug 'Juan Carlos es el Rey de España', ver README)."""
         out = StreamingSpeaker(self.tts, self.speaker)
         print(f"🤖 {answer_text}", flush=True)
         out.say(answer_text)
@@ -107,7 +107,14 @@ class Assistant:
         turn.context_hits = hits
 
         if self.rag and not hits and not is_chitchat(retrieval_query):
-            return self._abstain(question, turn, t0, has_history)
+            answer_text = abstain_reply(retrieval_query, has_history)
+            return self._fixed_reply(question, answer_text, turn, t0)
+
+        if self.rag and hits:
+            ambiguous = ambiguous_docs(hits, self.cfg.rag.ambiguity_threshold)
+            if ambiguous:
+                answer_text = clarify_reply(*ambiguous, self.cfg.rag.doc_topics)
+                return self._fixed_reply(question, answer_text, turn, t0)
 
         context = Retriever.format_context(hits) if hits else None
 
@@ -183,4 +190,7 @@ class Assistant:
                     break
                 with self.mic.open() as mic:  # ventana de follow-up sin repetir wake word
                     audio = self.vad.record(mic, timeout_s=v.followup_s)
+            # termina la ventana de conversación: limpiar antes de la próxima (ver LocalLLM.reset)
+            # para que una charla nueva no arrastre contexto de una completamente distinta
+            self.reset_conversation()
             print("   (esperando wake word…)\n" if self.wake else "", end="", flush=True)

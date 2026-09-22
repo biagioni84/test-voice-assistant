@@ -30,9 +30,21 @@ class LocalLLM:
         # penaliza tokens con caracteres CJK para prevenir la fuga de idioma (ver voice/guardrails.py
         # y README) en vez de detectarla después y reintentar. Se usa en ambos roles.
         self._cjk_bias = cjk_token_bias(self.llm)
+        # NO se cachea el prefijo estático del reescritor con save_state()/load_state(): medido y
+        # descartado (ver README) -- el costo de load_state() (~350-760ms, con o sin offload a GPU)
+        # es igual o peor que el prefill que se ahorra. Mitigación real: pocos ejemplos few-shot
+        # (voice/rewrite.py) para que el prefijo en sí sea chico.
 
     def reset(self) -> None:
+        """Arranca una charla nueva de cero: limpia self.history y también el contexto interno de
+        llama.cpp (self.llm.reset(), que resetea n_tokens). No cuesta nada y es lo correcto para no
+        acumular contexto sin límite entre charlas -- aunque, en la investigación de un bug de
+        "y eso" que se resolvía mal, esto NO resultó ser la causa (ver README): la causa real era
+        que el texto de respuesta usado en los ejemplos few-shot de voice/rewrite.py no coincidía
+        con lo que el LLM de respuesta genera de verdad, y una versión más corta del system_prompt
+        del reescritor no generalizaba bien esa diferencia."""
         self.history.clear()
+        self.llm.reset()
 
     def record_turn(self, question: str, answer: str) -> None:
         """Guarda la pregunta ORIGINAL del usuario (no la reescrita) y la respuesta -- así el

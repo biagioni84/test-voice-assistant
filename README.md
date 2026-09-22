@@ -272,6 +272,112 @@ Próximos pasos, en orden: mejorar el chunking (separar hechos que hoy están me
 chunk) → un lookup estructurado de horarios en vez de texto libre → si nada de eso alcanza, un modelo
 más grande (7-8B o el MoE de la sección de la Orin).
 
+## Latencia del reescritor: dos intentos, dos callejones sin salida
+
+Antes de perseguir un número de latencia absoluto en esta laptop (RTX 3050, no es el hardware de
+destino -- la Orin), se midieron métricas portables con `verbose=True` de llama.cpp:
+
+- La llamada al reescritor (~616 tokens de prompt, ~10-30 de salida) se reparte en **793ms de
+  prefill (616 tokens) vs 319ms de decode (~11 tokens)** -- el prefill domina, no la generación.
+- **9 de 36 capas del LLM están en CPU** (`n_gpu_layers=28`, ver sección de LLM más arriba) -- eso
+  ya se sabía y está documentado, pero se confirma que afecta tanto prefill como decode (cada
+  forward pass pasa por esas 9 capas en CPU).
+- **569 de esos 616 tokens (92%) son el prefijo estático** (system prompt + 5 ejemplos few-shot de
+  `voice/rewrite.py`) -- se repite idéntico en cada llamada.
+
+Con ese 92% estático, cachearlo parecía el punto obvio. Se probaron dos caminos, y **ninguno dio una
+mejora neta**:
+
+1. **`Llama.save_state()`/`load_state()`** (el equivalente en llama-cpp-python a "cache_prompt"):
+   sí evita reprocesar el prefijo (confirmado: prefill bajó de 616 a 54 tokens), pero `load_state()`
+   en sí mismo cuesta 350-760ms -- un round-trip de memoria que se come el ahorro. Medido también con
+   el modelo 100% en GPU (`n_gpu_layers=-1`, para descartar que fuera el split CPU/GPU): mismo
+   resultado, `load_state()` sigue costando más de lo que ahorra. Es una limitación de cómo
+   `llama-cpp-python` serializa el estado, no del hardware. **Revertido.**
+2. **Condensar el system prompt** (238→131 tokens, prefijo total 569→462, -19%): en un test aislado
+   con texto de historial escrito a mano parecía funcionar igual de bien -- pero ese test tenía un
+   sesgo: usaba el mismo texto exacto que el ejemplo few-shot. Con texto **real** generado por el LLM
+   de respuesta (que nunca coincide palabra por palabra con el few-shot), la versión condensada
+   fallaba justo en el caso "y eso" que costó arreglar antes. La instrucción más larga y repetitiva
+   generaliza mejor aunque "diga lo mismo" en menos palabras -- una lección de prompt engineering más
+   que de ingeniería de sistemas. **Revertido.**
+
+La latencia real (con el prompt largo, sin cache, offload parcial) quedó donde estaba: **p50≈870ms,
+p95≈1000ms cuando el reescritor corre** (n=27, ver corrida completa más abajo). No hubo mejora en esta
+máquina. El objetivo de p95 queda pendiente de medir en la Orin real, donde tanto el ancho de banda de
+memoria como la disponibilidad de VRAM (64GB, sin necesidad de partial offload) son estructuralmente
+distintos -- una segunda instancia de `Llama` dedicada solo al reescritor (para que el cacheo de
+prefijo *nativo* de llama.cpp funcione sin interferencia de las llamadas de respuesta intercaladas)
+sería viable ahí por VRAM y no acá (duplicaría los pesos del modelo en GPU).
+
+**Bug real encontrado en el camino** (no relacionado con la latencia): `Assistant.run()` nunca
+reseteaba `self.llm.history` entre ventanas de conversación separadas (solo `scripts/eval.py` lo
+hacía, vía `reset_conversation()`). En uso real esto significa que una charla nueva ("hey jarvis,
+contame un chiste") podía arrastrar el historial de una charla previa sin relación, horas antes.
+Arreglado: `run()` llama a `reset_conversation()` al cerrarse cada ventana de conversación.
+
+## Dev vs. validación en scripts/eval.py
+
+Los casos que se usaron para ajustar el prompt/few-shot de `voice/rewrite.py` (p.ej.
+`cambio_de_dia_en_followup`) miden regresión, no generalización -- el prompt se ajustó *mirando
+exactamente esos casos*. Se agregó el campo `split: validation` para un grupo separado de casos
+holdout, con formulaciones que no se parecen a ningún ejemplo few-shot, agregados *después* de
+terminar de ajustar el prompt y sin tocarlos más (correr `scripts/eval.py --split validation`).
+
+**Resultado (4 casos nuevos, formulaciones nunca vistas en los few-shot):**
+
+| Formulación nueva | Resultado |
+|---|---|
+| "¿y ahí?" (variante de "eso" con otra palabra) | No se resolvió sola, pero abstuvo con seguridad (no alucinó) y se auto-corrigió en el siguiente turno |
+| "¿Y lo mismo pero para el sábado?" (patrón nuevo) | No generalizó -- abstuvo |
+| "dale, ¿y el otro día que te dije?" | Caso mal diseñado (presupone un "otro día" que nunca se mencionó) -- no es señal limpia |
+| "Uy perdón, quise decir el sábado." (corrección sin "no"/"te pregunté") | ✓ Generalizó bien |
+
+**2/4 generalizan, 2/4 no** -- el prompt captura bien el *concepto* que está explícito en el texto de
+la instrucción (`"eso", "ahí"` se mencionan literalmente) pero no generaliza a formas nuevas no vistas
+ni en la instrucción ni en los ejemplos ("lo mismo pero para X"). Importante: en ningún caso de los que
+falló, alucinó -- siempre cayó a la abstención segura ("No lo encontré, ¿me lo preguntás de otra
+forma?"). Es una limitación de cobertura, no de seguridad.
+
+## Chunking más fino + gate de ambigüedad cross-doc
+
+**Chunking** (`voice/rag.py`): antes, `_chunk()` combinaba párrafos consecutivos de un mismo
+documento hasta `chunk_chars=500`, así que el título, la intro y el horario de `oficina.md` quedaban
+en un solo chunk (474 caracteres, entraban justos). Ahora **un chunk = un párrafo = un hecho**, sin
+combinar entre sí (sí se sigue partiendo un párrafo individual que por sí solo supere `chunk_chars`).
+Cada chunk además lleva el título del documento (`_extract_title()`, del primer heading markdown):
+`oficina.md` pasó de 2 chunks a 5, cada uno con `"Oficina: <hecho>"`.
+
+**Gate de ambigüedad** (`voice/guardrails.py: ambiguous_docs()`): si los dos documentos *distintos*
+con mejor score están a menos de `rag.ambiguity_threshold` (0.10) de diferencia, se corta sin llamar
+al LLM y se pide aclaración nombrando los dos temas (`clarify_reply()`, usa `rag.doc_topics` del
+config para los nombres). Mismo mecanismo que la abstención (`_fixed_reply` en `voice/pipeline.py`,
+refactorizado para servir a los dos casos).
+
+**Resultado en `retrieval_ambiguo_dos_docs`** (el bug de "inventa una política mezclando dos docs"):
+2 de 3 variantes ahora piden aclaración en vez de alucinar. La 3ª (`oficina.md` domina con
+score-gap=0.21) no es ambigüedad real -- es el modelo malinterpretando un chunk claro y dominante, un
+problema distinto que el gate no puede resolver (es "bug A" puro, ver más abajo).
+
+**Límite real encontrado, no resuelto** (dos manifestaciones del mismo problema): el coseno de
+similaridad de embeddings no distingue "la pregunta toca dos temas de verdad" de "un chunk sin
+relación tiene vocabulario parecido por casualidad".
+- `pregunta_compuesta` (una sola pregunta, sobre un solo doc) dispara el gate de ambigüedad por
+  error: su score-gap real (`oficina.md` vs `recursos_humanos.md` = 0.04) es **idéntico en magnitud**
+  al de una ambigüedad real (`retrieval_ambiguo_dos_docs` variante 2 = 0.04) -- no hay umbral que
+  separe limpiamente ambos casos con esta señal sola.
+- El chunking más fino además **destapó** un false-positive nuevo en `comentario_sin_tema_no_corta_continuidad`:
+  el chunk aislado de "horario de atención" de `soporte_tecnico.md` (antes diluido junto a otro
+  contenido del mismo doc) ahora matchea con más precisión y pasa `min_score` (0.36 vs el umbral de
+  0.35) para una pregunta que solo comparte vocabulario incidental ("responder"/"atención"). Subir
+  `min_score` no lo arregla sin romper matches legítimos de score igual de bajo (`oficina.md@0.37`
+  en follow-ups cortos).
+
+En ambos casos la solución de verdad es la que el pedido original ya anticipaba: un **reranker**
+(cross-encoder u otro modelo que juzgue relevancia semántica en vez de similaridad de embeddings
+cruda) en vez de comparar directamente los scores de coseno. No está implementado -- el gate actual
+opera sobre los scores de retrieval tal cual, sin una etapa de reranking real.
+
 ## Testear el LLM/RAG con scripts/eval.py
 
 Herramienta de desarrollo (no de producción): corre una lista de casos de prueba contra el LLM/RAG real
@@ -293,7 +399,8 @@ que medía ruido de muestreo en vez de robustez real. También soporta `type: re
 RAG ni el LLM de respuesta — útil para saber si un fallo es de la reescritura o de lo que pasa después.
 `--show-chunk-text` muestra el texto completo de cada chunk recuperado (no solo `source@score`), y al
 final de la corrida se reporta la latencia de la reescritura (p50/p95, con y sin contar los turnos que
-no la disparan por no tener historial todavía).
+no la disparan por no tener historial todavía). `--split dev` / `--split validation` corre solo esos
+casos (ver la sección "Dev vs. validación" más arriba); `--only <id>` corre un caso puntual.
 
 **Guardrails deterministas** (`voice/guardrails.py`, no dependen de que el LLM "decida" seguir una
 instrucción):
@@ -318,20 +425,24 @@ instrucción):
 | Chiste sin relación a los docs | ✗ 2/5 cambiaba a chino a mitad de frase | ✓ **5/5** en español limpio |
 | Horarios, reset de contraseña, vacaciones, trabajo remoto, follow-ups cortos, pregunta repetida, grosería | ✓ ya pasaban | ✓ sin regresión |
 
-**Sigue roto (bug de "fidelidad al contexto" — prioridad 2, no se tocó código todavía):**
+*(La tabla de arriba es de la ronda del 22/09, cuando se agregaron los guardrails de identidad/CJK.
+El "cambio de día en un follow-up" que quedaba roto ahí se arregló con la reescritura de consulta —
+ver esa sección más arriba. El estado actual, más las rondas de latencia/dev-validación/chunking, está
+resumido abajo.)*
 
-- **Cambio de día en un follow-up**: con `--show-chunk-text` se confirmó que el chunk correcto (con
-  sábados *y* domingos) casi siempre se recupera bien — **no es un bug de retrieval**, es el modelo
-  ignorando el dato correcto que tiene delante. De 5 variantes: 2/5 responden bien, 1/5 repite
-  literalmente el bug original (habla de domingo cuando preguntan por sábado), y **2/5 ahora abstienen
-  en vez de responder** — efecto secundario nuevo de la abstención: esas formulaciones (>4 palabras) no
-  recuperan nada por sí solas y no califican para el fallback de sticky-hits, así que se corta ahí
-  aunque el dato estaba disponible 2 turnos atrás. Punto a discutir antes de tocar esto.
-- **Pregunta que roza dos documentos** (horario + trabajo remoto): confirmado sistemático, 3/3 fallan,
-  cada vez de forma distinta (a veces inventa una política, a veces contradice directamente el horario
-  real aunque el chunk correcto sí se haya recuperado).
+**Estado actual (23/09, `tests/eval_questions.yaml`, ~64 turnos entre dev y validación):**
 
-Quedan documentados en `tests/eval_questions.yaml`; el fix se discute aparte.
+| Área | Estado |
+|---|---|
+| Horarios, contraseña, vacaciones, trabajo remoto, consistencia, grosería (control) | ✓ sin regresión |
+| Cambio de día en follow-up (5 variantes, antes roto) | ✓ **5/5** con la reescritura de consulta |
+| Identidad inventada, nombre común, multi-turno, chiste (guardrails deterministas) | ✓ sin regresión |
+| Validación holdout (formulaciones nuevas, no usadas para ajustar el prompt) | 2/4 generalizan bien; 2/4 no resuelven pero abstienen seguro (nunca alucinan) |
+| Cross-doc ambiguo (gate nuevo) | 2/3 piden aclaración correctamente; 1/3 sigue siendo bug de fidelidad al contexto, no de ambigüedad |
+| `pregunta_compuesta` | falso positivo conocido del gate de ambigüedad (ver arriba) |
+| `comentario_sin_tema_no_corta_continuidad` (turno del medio) | regresión nueva del chunking más fino (ver arriba) |
+
+Todo documentado con el detalle completo en `tests/eval_questions.yaml` y en las secciones de arriba.
 
 ## Estructura
 

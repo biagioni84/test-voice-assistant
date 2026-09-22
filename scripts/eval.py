@@ -106,6 +106,7 @@ def main() -> None:
     ap.add_argument("--cases", default="tests/eval_questions.yaml")
     ap.add_argument("--out", default=None, help="default: eval_results/<timestamp>.md")
     ap.add_argument("--only", default=None, help="correr solo el caso con este id")
+    ap.add_argument("--split", choices=["dev", "validation"], default=None, help="correr solo casos de ese split")
     ap.add_argument("--show-chunk-text", action="store_true", help="ver el texto completo de cada chunk recuperado")
     args = ap.parse_args()
 
@@ -113,6 +114,8 @@ def main() -> None:
     cases = yaml.safe_load(cases_path.read_text(encoding="utf-8"))
     if args.only:
         cases = [c for c in cases if c["id"] == args.only]
+    if args.split:
+        cases = [c for c in cases if c.get("split", "dev") == args.split]
 
     cfg = load_config()
     cfg.wakeword.enabled = False
@@ -123,12 +126,21 @@ def main() -> None:
 
     header = [f"# Eval run — {datetime.datetime.now():%Y-%m-%d %H:%M} — {cases_path.name}", ""]
     body: list[str] = []
-    for case in cases:
-        if case.get("type") == "rewrite":
-            body += run_rewrite_case(bot, case)
-        else:
-            for label, turns in case_variants(case):
-                body += run_case(bot, case, label, turns, args.show_chunk_text)
+    # separados en secciones: 'dev' se usó para ajustar el prompt/few-shot de voice/rewrite.py (no
+    # mide generalización); 'validation' es holdout, formulaciones no vistas durante el ajuste.
+    for split in ("dev", "validation"):
+        split_cases = [c for c in cases if c.get("split", "dev") == split]
+        if not split_cases:
+            continue
+        title = "DEV (usados para ajustar el prompt)" if split == "dev" else "VALIDACIÓN (holdout, no se ajustó nada contra estos)"
+        body.append(f"# {title} — {len(split_cases)} casos")
+        body.append("")
+        for case in split_cases:
+            if case.get("type") == "rewrite":
+                body += run_rewrite_case(bot, case)
+            else:
+                for label, turns in case_variants(case):
+                    body += run_case(bot, case, label, turns, args.show_chunk_text)
 
     if rewrite_latencies_ms:
         def pct(xs, p):

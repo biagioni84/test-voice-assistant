@@ -19,6 +19,10 @@ cual, no una versión abreviada con "eso". Si el usuario corrige algo ("no, te p
 sábado"), la pregunta reescrita usa la corrección, no lo que se había hablado antes. No respondas
 la pregunta. No agregues información que no esté en el historial ni en la pregunta actual. Devolvé
 SOLO la pregunta reescrita, nada más -- sin explicaciones ni comillas."""
+# (probado y descartado: una versión condensada de este prompt, ~130 tokens en vez de ~240, parecía
+# preservar el significado pero era una instrucción más débil -- fallaba justo en el caso de "y eso"
+# con texto de respuesta REAL del LLM (no el texto exacto de los ejemplos few-shot). El ahorro de
+# tokens no vale la regresión; ver README.)
 
 # (historial [(usuario, asistente), ...], pregunta actual, reescritura esperada)
 _EXAMPLES: list[tuple[list[tuple[str, str]], str, str]] = [
