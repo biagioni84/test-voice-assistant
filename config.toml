@@ -1,0 +1,62 @@
+# Configuración del asistente de voz local.
+# Presupuesto de hardware objetivo: RTX 3050 4GB VRAM / 31GB RAM / i5-12450H (12 hilos).
+
+[audio]
+sample_rate = 16000        # lo que esperan wake word, VAD y Whisper
+# mic_name = ""            # substring del nombre del micrófono; vacío = default de PulseAudio
+# speaker_name = ""
+
+[wakeword]
+enabled = true
+model = "hey_jarvis"       # preentrenados de openWakeWord: hey_jarvis, alexa, hey_mycroft, hey_rhasspy
+threshold = 0.5
+vad_threshold = 0.5        # exige voz real (Silero) además del score del wake word; baja falsos positivos
+noise_suppression = true   # SpeexDSP, barato; ayuda contra ruido de fondo estacionario (p.ej. fan de la Orin)
+
+[vad]
+speech_threshold = 0.5     # prob. de Silero para considerar voz
+end_silence_ms = 900       # silencio que marca fin de frase
+min_speech_ms = 250        # menos que esto se descarta (ruido)
+no_speech_timeout_s = 6.0  # tras el wake word, si nadie habla, vuelve a IDLE
+max_utterance_s = 20.0
+followup_s = 5.0           # ventana de conversación sin repetir wake word (0 = desactivar)
+
+[stt]
+model = "turbo"            # large-v3-turbo
+device = "cuda"
+compute_type = "int8_float16"   # ~1GB VRAM. Alternativa: "float16" (~1.6GB) o device="cpu"+"int8"
+language = "es"
+beam_size = 1
+
+[rag]
+enabled = true
+docs_dir = "docs"
+embed_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+top_k = 3
+min_score = 0.30           # bajo este coseno no se inyecta contexto
+chunk_chars = 500
+
+[llm]
+# Medido con scripts/bench.py en esta máquina (llama-cpp-python COMPILADO con CUDA, ver README):
+#   gpu_layers=0  (CPU puro): ~5.2 tok/s,  fin de voz->1er audio ~5.7s  (lo que sentiste "muy lento")
+#   gpu_layers=20 (parcial):  ~15.4 tok/s, fin de voz->1er audio ~1.9s, VRAM ~2.9/4.0GB (margen ~1.1GB)
+#   gpu_layers=28 (parcial):  ~20.9 tok/s, fin de voz->1er audio ~2.0s, VRAM ~3.3/4.0GB (margen ~0.7GB) <- default
+#   gpu_layers=-1 (todas=36): ~42.5 tok/s, fin de voz->1er audio ~1.1s, VRAM ~3.9/4.0GB (margen ~0.2GB, arriesgado)
+# El 7B con gpu_layers=-1 NO entra en 4GB: el driver empieza a spillear a RAM compartida y todo se
+# vuelve más lento (incluso Whisper, que comparte GPU). Por eso el default sigue siendo el 3B.
+repo = "bartowski/Qwen2.5-3B-Instruct-GGUF"
+file = "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+n_ctx = 4096
+n_threads = 6              # solo importa para las capas que queden en CPU
+n_gpu_layers = 28          # subir a -1 si nada más usa la GPU y querés el máximo; bajar si ves OOM
+max_tokens = 200
+temperature = 0.6
+history_turns = 4
+system_prompt = """Eres un asistente de voz local. Respondes siempre en español, en 1 a 3 frases cortas y naturales, como si hablaras en voz alta.
+No uses markdown, listas, emojis ni símbolos. Escribe los números y unidades como se pronuncian.
+Si se te da un CONTEXTO, úsalo para responder; si no contiene la respuesta, dilo con honestidad y responde con lo que sepas."""
+
+[tts]
+voice = "es_AR-daniela-high"
+voices_dir = "models/piper"
+length_scale = 1.0         # >1 = más lento

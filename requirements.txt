@@ -1,0 +1,36 @@
+# STT (GPU): faster-whisper usa CTranslate2 + cuBLAS/cuDNN 12 (vienen como wheels de pip)
+faster-whisper>=1.1
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# Wake word + VAD (CPU, ONNX)
+# openwakeword se instala aparte con --no-deps (tflite-runtime no tiene wheel cp312)
+pysilero-vad
+onnxruntime
+speexdsp_ns          # supresión de ruido para openWakeWord (enable_speex_noise_suppression)
+
+# TTS (CPU)
+piper-tts>=1.3
+
+# Embeddings para RAG (CPU, ONNX, sin torch)
+fastembed
+
+# Audio I/O via PulseAudio (WSLg)
+soundcard
+numpy
+
+huggingface_hub
+
+# deps de openwakeword (backend ONNX)
+scipy
+scikit-learn
+tqdm
+requests
+
+# Instalar aparte:
+#   uv pip install --no-deps openwakeword
+#
+#   llama-cpp-python CON soporte CUDA (imprescindible para que el LLM no vaya muy lento; ver README):
+#   CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86" FORCE_CMAKE=1 \
+#     uv pip install --no-binary llama-cpp-python llama-cpp-python
+#   (86 = compute capability de RTX 30xx/Ampere; ajustar si es otra GPU)
