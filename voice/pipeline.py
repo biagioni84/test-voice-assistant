@@ -8,6 +8,7 @@ import numpy as np
 
 from .audio import Mic, Speaker
 from .config import Config
+from .guardrails import abstain_reply, is_chitchat
 from .llm import LocalLLM
 from .rag import Retriever
 from .stt import Transcriber
@@ -87,6 +88,26 @@ class Assistant:
             self._sticky_hits = hits
         return hits
 
+    def _abstain(self, question: str, turn: Turn, t0: float) -> Turn:
+        """Corta acá sin llamar al LLM (ver voice/guardrails.py): sin esto, "responder como
+        asistente general" era justo lo que llevaba a inventar identidades (bug 'Juan Carlos es el
+        Rey de España', ver README)."""
+        answer_text = abstain_reply(question)
+        out = StreamingSpeaker(self.tts, self.speaker)
+        print(f"🤖 {answer_text}", flush=True)
+        out.say(answer_text)
+        out.finish()
+        self.llm.history += [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer_text},
+        ]
+        turn.answer = answer_text
+        if out.first_audio_at:
+            turn.t_first_audio = out.first_audio_at - t0
+        if out.collected:
+            turn.audio, turn.sample_rate = np.concatenate(out.collected), self.tts.sample_rate
+        return turn
+
     def answer(self, question: str, t_user_done: float | None = None) -> Turn:
         turn = Turn(question=question)
         t0 = t_user_done or time.monotonic()
@@ -95,6 +116,10 @@ class Assistant:
         hits = self._retrieve_sticky(question) if self.rag else []
         turn.t_rag = time.monotonic() - t
         turn.context_hits = hits
+
+        if self.rag and not hits and not is_chitchat(question):
+            return self._abstain(question, turn, t0)
+
         context = Retriever.format_context(hits) if hits else None
 
         out = StreamingSpeaker(self.tts, self.speaker)

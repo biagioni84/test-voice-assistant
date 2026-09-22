@@ -52,7 +52,9 @@ n_ctx = 4096
 n_threads = 6              # solo importa para las capas que queden en CPU
 n_gpu_layers = 28          # subir a -1 si nada más usa la GPU y querés el máximo; bajar si ves OOM
 max_tokens = 200
-temperature = 0.6
+temperature = 0.0          # greedy/determinístico. Con >0 la misma conversación podía dar resultados
+                            # distintos entre corridas (ver tests/eval_questions.yaml); con 0 se puede
+                            # comparar de verdad si un cambio arregló algo, sin ruido de muestreo
 history_turns = 4
 system_prompt = """Eres un asistente de voz local. Respondes siempre en español, en 1 a 3 frases cortas y naturales, como si hablaras en voz alta.
 No uses markdown, listas, emojis ni símbolos. Escribe los números y unidades como se pronuncian.

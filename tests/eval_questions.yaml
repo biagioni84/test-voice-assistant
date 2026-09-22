@@ -3,10 +3,13 @@
 # (o Claude) leyendo el resultado, no hay pass/fail automático acá.
 #
 # Cada caso:
-#   id:     nombre corto, único, sin espacios
-#   note:   por qué existe este caso / qué bug prueba (opcional pero recomendado)
-#   expect: qué se espera que pase, en texto libre, para ayudar a juzgar (opcional)
-#   turns:  lista de preguntas del usuario en orden (una charla; se resetea el historial entre casos)
+#   id:       nombre corto, único, sin espacios
+#   note:     por qué existe este caso / qué bug prueba (opcional pero recomendado)
+#   expect:   qué se espera que pase, en texto libre, para ayudar a juzgar (opcional)
+#   turns:    lista de preguntas del usuario en orden (una charla; se resetea el historial entre casos)
+#   variants: en vez de 'turns', varias formulaciones distintas del mismo caso (lista de listas de
+#             turnos). Con temperature=0 (determinístico) repetir la MISMA pregunta no sirve para medir
+#             nada -- 'variants' mide robustez a CÓMO se pregunta, no al muestreo aleatorio.
 
 - id: horario_sabado_directo
   note: caso de control, pregunta simple con respuesta clara en oficina.md
@@ -37,16 +40,22 @@
 
 - id: cambio_de_dia_en_followup
   note: >
-    regresión del bug original reportado — el modelo respondía sobre domingo cuando le
-    preguntaban por sábado, arrastrado por los turnos anteriores. repeat:5 para ver qué tan
-    seguido falla (temperature=0.6 -> no es determinístico, un solo intento no alcanza para
-    saber si un cambio realmente lo arregló)
+    BUG ABIERTO (22/09, no se tocó código todavía -- esto es "bug A", prioridad 2). Diagnóstico
+    con --show-chunk-text confirmó que el chunk correcto (con sábados Y domingos) casi siempre SE
+    RECUPERA bien -- no es un bug de retrieval, es el modelo ignorando el dato correcto que tiene
+    delante. Con las 5 variantes: 2/5 responden bien, 1/5 sigue hablando de domingo (el bug
+    original, textual), y 2/5 ahora ABSTIENEN en vez de responder -- efecto secundario nuevo: esas
+    2 formulaciones (>4 palabras) no recuperan nada solas y no califican para el fallback de
+    sticky-hits (heurístico de "corto" ≤4 palabras), así que la abstención determinista corta ahí
+    aunque el dato SÍ estaba disponible 2 turnos atrás. A discutir: ¿subir el umbral de "corto", o
+    hacer que el abstain también intente sticky-hits antes de rendirse?
   expect: "debe responder específicamente sobre el sábado (10 a 13hs), no repetir lo del domingo"
-  repeat: 5
-  turns:
-    - "¿A qué hora abre la oficina el domingo?"
-    - "y eso"
-    - "Te pregunté el sábado a qué hora abre."
+  variants:
+    - ["¿A qué hora abre la oficina el domingo?", "y eso", "Te pregunté el sábado a qué hora abre."]
+    - ["¿A qué hora abre la oficina el domingo?", "y eso", "¿Y los sábados?"]
+    - ["¿A qué hora abre la oficina el domingo?", "y eso", "Perdón, pregunté por el sábado."]
+    - ["¿A qué hora abre la oficina el domingo?", "y eso", "¿Cuál es el horario del sábado?"]
+    - ["¿A qué hora abre la oficina el domingo?", "y eso", "No, te pregunté por el sábado."]
 
 - id: comentario_sin_tema_no_corta_continuidad
   note: >
@@ -60,29 +69,34 @@
 
 - id: identidad_inventada
   note: >
-    BUG ABIERTO: "Juan Carlos" no aparece en ningún documento. A veces el RAG trae el chunk de
-    recursos_humanos.md ("el jefe directo") y el modelo fusiona ambas cosas; otras veces no trae
-    nada y el modelo usa conocimiento general del mundo real (Juan Carlos I, rey de España) como
-    si aplicara acá. repeat:5 para ver cuál de las dos variantes sale y con qué frecuencia.
-  expect: "debe decir que no tiene información sobre quién es Juan Carlos en este contexto"
-  repeat: 5
-  turns:
-    - "¿Quién es Juan Carlos?"
+    FIJADO (22/09): "Juan Carlos" no aparece en ningún documento; el modelo usaba conocimiento
+    general del mundo real (Juan Carlos I, rey de España). La abstención determinista
+    (voice/guardrails.py) corta esto sin llamar al LLM. 5/5 variantes pasan ahora, siempre con la
+    misma respuesta fija.
+  expect: "debe decir que no tiene información sobre esa persona, siempre con la misma respuesta"
+  variants:
+    - ["¿Quién es Juan Carlos?"]
+    - ["¿Vos conocés a Juan Carlos?"]
+    - ["Decime quién es Juan Carlos."]
+    - ["¿Sabés algo de Juan Carlos?"]
+    - ["¿Quién es este tal Juan Carlos?"]
 
 - id: identidad_inventada_nombre_comun
   note: >
-    variante con un nombre común pero sin ningún referente real obvio (a diferencia de "Juan
-    Carlos" = Juan Carlos I de España) — ¿el guardrail funciona mejor cuando no hay una persona
-    real famosa con ese nombre en la que "caer"?
-  expect: "debe admitir que no conoce a esa persona"
-  repeat: 3
-  turns:
-    - "¿Quién es María Fernández?"
+    FIJADO (22/09): 3/3 pasan con la abstención determinista (antes 2/3, con la variante restante
+    inventando una actriz). La fama del nombre real ya no importa: ninguna llega a generarse con
+    el LLM.
+  expect: "debe admitir que no conoce a esa persona, siempre con la misma respuesta"
+  variants:
+    - ["¿Quién es María Fernández?"]
+    - ["¿Conocés a María Fernández?"]
+    - ["Decime quién es María Fernández."]
 
 - id: identidad_inventada_multiturn
   note: >
-    BUG ABIERTO, versión conversación completa (sin el error de STT que la disparó originalmente,
-    ver README sección de bugs conocidos) — prueba si insistir saca al modelo de la alucinación
+    FIJADO (22/09): versión conversación completa (sin el error de STT que la disparó originalmente,
+    ver README). Antes escalaba con cada insistencia (llegaba a inventar que "el jefe directo de
+    Juan Carlos era Felipe VI"); ahora los 3 turnos responden consistentemente con la abstención fija.
   expect: "en algún punto debería reconocer que no sabe de quién se habla, no seguir afirmando 'Juan Carlos es el jefe directo'"
   turns:
     - "¿Quién es Juan Carlos?"
@@ -91,13 +105,16 @@
 
 - id: chiste_generico
   note: >
-    caso de control, pregunta sin relación a los documentos, no debería intentar usar RAG.
-    repeat:5 porque en la corrida anterior el remate salió en chino (Qwen es un modelo entrenado
-    por un lab chino, a veces cambia de idioma a mitad de respuesta) — ver qué tan seguido pasa
+    FIJADO (22/09): antes el remate salía en chino 2/5 veces (Qwen es un modelo entrenado por un
+    lab chino). El logit_bias que penaliza tokens CJK (voice/guardrails.py) dio 5/5 en español
+    limpio.
   expect: "debe responder con un chiste corto, todo en español, sin forzar contenido de los documentos"
-  repeat: 5
-  turns:
-    - "Contame un chiste corto."
+  variants:
+    - ["Contame un chiste corto."]
+    - ["Decime un chiste gracioso."]
+    - ["¿Sabés algún chiste?"]
+    - ["Tirame un chiste."]
+    - ["Hacéme reír con un chiste."]
 
 - id: vacaciones
   note: caso de control, contenido de recursos_humanos.md (todavía no cubierto en los casos anteriores)
@@ -113,12 +130,16 @@
 
 - id: retrieval_ambiguo_dos_docs
   note: >
-    pregunta que roza dos documentos a la vez (horario de oficina.md + política de trabajo
-    remoto de recursos_humanos.md) — caso interesante para ver si el RAG trae los dos, uno solo,
-    o ninguno, y si la respuesta los mezcla bien o mal
-  expect: "idealmente debería aclarar que el trabajo remoto es un tema aparte del horario de oficina"
-  turns:
-    - "¿Puedo trabajar desde casa los sábados?"
+    BUG ABIERTO (22/09, no se tocó código -- bug A, prioridad 2). Confirmado sistemático: 3/3
+    variantes fallan, cada una de forma distinta ("los sábados son de presencia obligatoria",
+    "los sábados la oficina está cerrada" -- directamente contradice oficina.md aunque esa vez SÍ
+    se recuperó el chunk correcto --, "no están permitidos para trabajar remoto"). No fue una sola
+    vez.
+  expect: "no debería inventar una política que mezcle las dos cosas"
+  variants:
+    - ["¿Puedo trabajar desde casa los sábados?"]
+    - ["¿El sábado puedo hacer home office?"]
+    - ["¿Está permitido trabajar remoto los sábados?"]
 
 - id: pregunta_repetida_consistencia
   note: >

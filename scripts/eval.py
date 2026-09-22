@@ -5,6 +5,9 @@ solo -- el juicio de si cada caso está bien lo hace un humano (o Claude) leyend
     python scripts/eval.py                        # corre todos los casos de tests/eval_questions.yaml
     python scripts/eval.py --cases tests/otro.yaml
     python scripts/eval.py --out eval_results/mi_corrida.md
+    python scripts/eval.py --show-chunk-text       # además del source@score, el texto completo del
+                                                    # chunk recuperado (para diagnosticar si el RAG
+                                                    # trajo lo que debía, sin adivinar)
 """
 import argparse
 import datetime
@@ -21,22 +24,38 @@ from voice.config import load_config  # noqa: E402
 from voice.pipeline import Assistant  # noqa: E402
 
 
-def run_case(bot: Assistant, case: dict, run_n: int | None = None) -> list[str]:
+def case_variants(case: dict) -> list[tuple[str | None, list[str]]]:
+    """Con temperature=0 (determinístico) repetir la MISMA pregunta no aporta nada -- por eso
+    'variants' reemplaza al viejo 'repeat': varias formulaciones distintas del mismo caso, para
+    medir robustez a cómo se pregunta en vez de robustez al muestreo aleatorio."""
+    if "variants" in case:
+        n = len(case["variants"])
+        return [(f"variante {i}/{n}", v) for i, v in enumerate(case["variants"], 1)]
+    return [(None, case["turns"])]
+
+
+def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], show_chunk_text: bool) -> list[str]:
     bot.reset_conversation()
-    suffix = f" (corrida {run_n[0]}/{run_n[1]})" if run_n else ""
+    suffix = f" ({label})" if label else ""
     lines = [f"## {case['id']}{suffix}"]
-    if run_n is None or run_n[0] == 1:
+    if label is None or label.startswith("variante 1/"):
         if case.get("note"):
             lines.append(f"> **nota:** {case['note'].strip()}")
         if case.get("expect"):
             lines.append(f"> **se espera:** {case['expect'].strip()}")
     lines.append("")
-    for q in case["turns"]:
+    for q in turns:
         turn = bot.answer(q)
-        hits = ", ".join(f"{h.source}@{h.score:.2f}" for h in turn.context_hits) or "*(sin contexto)*"
         lines.append(f"- 🗣 **{q}**")
         lines.append(f"  - 🤖 {turn.answer}")
-        lines.append(f"  - RAG: {hits}")
+        if not turn.context_hits:
+            lines.append("  - RAG: *(sin contexto)*")
+        elif show_chunk_text:
+            for h in turn.context_hits:
+                lines.append(f"  - RAG: {h.source}@{h.score:.2f}: {h.text!r}")
+        else:
+            hits = ", ".join(f"{h.source}@{h.score:.2f}" for h in turn.context_hits)
+            lines.append(f"  - RAG: {hits}")
     lines.append("")
     return lines
 
@@ -45,10 +64,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", default="tests/eval_questions.yaml")
     ap.add_argument("--out", default=None, help="default: eval_results/<timestamp>.md")
+    ap.add_argument("--only", default=None, help="correr solo el caso con este id")
+    ap.add_argument("--show-chunk-text", action="store_true", help="ver el texto completo de cada chunk recuperado")
     args = ap.parse_args()
 
     cases_path = ROOT / args.cases
     cases = yaml.safe_load(cases_path.read_text(encoding="utf-8"))
+    if args.only:
+        cases = [c for c in cases if c["id"] == args.only]
 
     cfg = load_config()
     cfg.wakeword.enabled = False
@@ -60,9 +83,8 @@ def main() -> None:
     header = [f"# Eval run — {datetime.datetime.now():%Y-%m-%d %H:%M} — {cases_path.name}", ""]
     body: list[str] = []
     for case in cases:
-        n = case.get("repeat", 1)
-        for i in range(1, n + 1):
-            body += run_case(bot, case, run_n=(i, n) if n > 1 else None)
+        for label, turns in case_variants(case):
+            body += run_case(bot, case, label, turns, args.show_chunk_text)
 
     text = "\n".join(header + body)
     out_path.write_text(text, encoding="utf-8")

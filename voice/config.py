@@ -62,7 +62,8 @@ class LlmCfg:
     n_threads: int = 6
     n_gpu_layers: int = 0
     max_tokens: int = 200
-    temperature: float = 0.6
+    temperature: float = 0.0  # 0 = greedy/determinístico; con >0 la misma conversación puede dar
+                               # resultados distintos entre corridas (ver README, tests/eval_questions.yaml)
     history_turns: int = 4
     system_prompt: str = "Eres un asistente de voz. Responde en español, breve."
 

@@ -6,6 +6,7 @@ from typing import Iterator
 from llama_cpp import Llama
 
 from .config import LlmCfg, resolve
+from .guardrails import cjk_token_bias
 
 
 class LocalLLM:
@@ -19,6 +20,9 @@ class LocalLLM:
             verbose=False,
         )
         self.history: list[dict] = []
+        # penaliza tokens con caracteres CJK para prevenir la fuga de idioma (ver voice/guardrails.py
+        # y README) en vez de detectarla después y reintentar
+        self._cjk_bias = cjk_token_bias(self.llm)
 
     def reset(self) -> None:
         self.history.clear()
@@ -39,6 +43,7 @@ class LocalLLM:
                 messages=messages,
                 max_tokens=self.cfg.max_tokens,
                 temperature=self.cfg.temperature,
+                logit_bias=self._cjk_bias,
                 stream=True,
             ):
                 tok = part["choices"][0]["delta"].get("content")

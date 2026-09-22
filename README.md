@@ -224,27 +224,49 @@ juicio de si cada caso está bien lo hace un humano (o Claude) leyendo el result
 ```
 
 Los casos viven en `tests/eval_questions.yaml` — se van agregando ahí a medida que aparecen bugs
-nuevos (cada caso tiene `note`/`expect` explicando qué prueba y por qué). Soporta `repeat: N` por caso:
-como `temperature=0.6` hace que las respuestas no sean determinísticas, un solo intento no alcanza para
-saber si algo "se arregló" — repetir varias veces da una idea real de la tasa de fallo.
+nuevos (cada caso tiene `note`/`expect` explicando qué prueba y por qué). Soporta `variants:` por caso:
+varias formulaciones distintas de la misma pregunta, para medir robustez a *cómo* se pregunta. Con
+`temperature=0` (ver `[llm]` en `config.toml`) la generación es determinística, así que repetir
+literalmente la misma pregunta ya no aporta nada — por eso `variants` reemplazó a un viejo `repeat: N`
+que medía ruido de muestreo en vez de robustez real.
 
-**Última corrida completa (31 ejecuciones, 22/09), resumen:**
+**Guardrails deterministas** (`voice/guardrails.py`, no dependen de que el LLM "decida" seguir una
+instrucción):
+- **Abstención sin CONTEXTO**: antes, cuando el RAG no traía nada, el prompt le decía al LLM "respondé
+  como asistente general" — y eso es lo que lo llevaba a inventar que "Juan Carlos" (sin ningún
+  documento que lo mencione) era el Rey de España. Ahora, si no hay CONTEXTO y la pregunta no es charla
+  social reconocible (lista blanca chica: saludos, chistes, preguntas sobre el propio asistente), se
+  corta con una respuesta fija **sin llamar al LLM**.
+- **logit_bias anti-CJK**: Qwen (entrenado por un lab chino) a veces cambiaba de idioma a mitad de
+  respuesta. En vez de detectar y reintentar, se penalizan (`-100`) los ~31.000 tokens del vocabulario
+  que contienen caracteres CJK (chino/japonés/coreano) *antes* de generar — ~0.3s calcularlo una sola
+  vez al cargar el modelo. `clean_for_speech` en `voice/tts.py` sigue filtrando CJK como red de
+  seguridad, por si algo igual se escapa.
 
-| Caso | Resultado |
-|---|---|
-| Horarios, reset de contraseña, vacaciones, trabajo remoto (preguntas directas) | ✓ Pass |
-| Pregunta sin ningún doc relacionado | ✓ Pass (admite que no sabe) |
-| Follow-ups cortos y comentarios sin tema en medio de la charla | ✓ Pass (fix de sticky-hits sostiene) |
-| Pregunta repetida dos veces seguidas | ✓ Pass (consistente) |
-| Comentario grosero / small talk | ✓ Pass (no fuerza contenido de los docs) |
-| Cambiar de día en un follow-up ("¿y el sábado?" después de hablar del domingo) | ✗ **5/5** corridas fallaron en dar una respuesta limpia sobre el día correcto |
-| "¿Quién es Juan Carlos?" (nombre sin doc, pero real y famoso) | ✗ **5/5** inventó que es el Rey de España (con fechas de reinado distintas e incorrectas cada vez) |
-| "¿Quién es María Fernández?" (nombre común, sin referente famoso obvio) | ✗ 1/3 inventó una actriz; 2/3 admitió que no sabía |
-| Chiste sin relación a los docs | ✗ **2/5** cambió de idioma a mitad de frase (remate en chino) |
-| Pregunta que roza dos documentos a la vez (horario de oficina + política de trabajo remoto) | ✗ inventó que "los sábados son de presencia obligatoria" (dato falso, mezcla dos políticas distintas) |
-| Pregunta compuesta (dos horarios en una sola pregunta) | ✗ dio un horario de cierre de sábado incorrecto (14hs en vez de 13hs) aun con el contexto correcto |
+**Resultado, antes → después de estos dos fixes** (33 ejecuciones, 22/09):
 
-Quedan documentados como casos de regresión en `tests/eval_questions.yaml`; los fixes se discuten aparte.
+| Caso | Antes | Después |
+|---|---|---|
+| "¿Quién es Juan Carlos?" (nombre real y famoso, sin doc) | ✗ 0/5 — inventaba que era el Rey de España | ✓ **5/5** — respuesta fija, sin alucinar |
+| "¿Quién es María Fernández?" (nombre común) | ✗ 1/3 inventaba una actriz | ✓ **3/3** |
+| Conversación completa insistiendo sobre Juan Carlos | ✗ escalaba (inventó que "el jefe directo de Juan Carlos era Felipe VI") | ✓ **consistente** en las 3 vueltas |
+| Chiste sin relación a los docs | ✗ 2/5 cambiaba a chino a mitad de frase | ✓ **5/5** en español limpio |
+| Horarios, reset de contraseña, vacaciones, trabajo remoto, follow-ups cortos, pregunta repetida, grosería | ✓ ya pasaban | ✓ sin regresión |
+
+**Sigue roto (bug de "fidelidad al contexto" — prioridad 2, no se tocó código todavía):**
+
+- **Cambio de día en un follow-up**: con `--show-chunk-text` se confirmó que el chunk correcto (con
+  sábados *y* domingos) casi siempre se recupera bien — **no es un bug de retrieval**, es el modelo
+  ignorando el dato correcto que tiene delante. De 5 variantes: 2/5 responden bien, 1/5 repite
+  literalmente el bug original (habla de domingo cuando preguntan por sábado), y **2/5 ahora abstienen
+  en vez de responder** — efecto secundario nuevo de la abstención: esas formulaciones (>4 palabras) no
+  recuperan nada por sí solas y no califican para el fallback de sticky-hits, así que se corta ahí
+  aunque el dato estaba disponible 2 turnos atrás. Punto a discutir antes de tocar esto.
+- **Pregunta que roza dos documentos** (horario + trabajo remoto): confirmado sistemático, 3/3 fallan,
+  cada vez de forma distinta (a veces inventa una política, a veces contradice directamente el horario
+  real aunque el chunk correcto sí se haya recuperado).
+
+Quedan documentados en `tests/eval_questions.yaml`; el fix se discute aparte.
 
 ## Estructura
 
