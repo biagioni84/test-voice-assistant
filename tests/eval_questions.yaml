@@ -256,15 +256,18 @@
 
 - id: retrieval_ambiguo_dos_docs
   note: >
-    MEJORADO CON RERANKER (23/09, ver README): originalmente 3/3 alucinaban mezclando 2 docs. Con el
-    reranker (jina-reranker-v2-base-multilingual) + min_score=0.0 recalibrado: variantes 1 y 2 ahora
-    ABSTIENEN honestamente (ningún doc puntúa positivo -- más seguro que forzar una aclaración). La
-    variante 3 recupera 1 solo doc correcto (ya no mezcla), pero el LLM lo malinterpreta (invierte
-    qué días son de presencia obligatoria) -- eso es "bug A" puro, no algo que retrieval pueda
-    arreglar. El gate de ambigüedad (ambiguous_docs) casi no llega a intervenir en estos 3 casos con
-    el reranker: al filtrar primero por min_score, rara vez quedan 2 candidatos parejos Y ambos
-    positivos a la vez -- se resuelven antes, por abstención o por un solo candidato claro.
+    MEJORADO CON RERANKER (23/09) y luego con gate_docs() rediseñado (24/09, ver README): con la
+    calibración actual, las 3 variantes solo recuperan recursos_humanos.md (oficina.md no cruza
+    min_score para estas preguntas puntuales) -- nunca llegan a la comparación de 2 documentos, así
+    que el rediseño del gate NO les cambia el resultado (antes y después: sin aclaración, un solo
+    doc como CONTEXTO). La variante 3 sigue con "bug A" (el LLM malinterpreta el único chunk
+    recuperado, invierte qué días son de presencia obligatoria) -- no es un problema de retrieval ni
+    del gate, documentado aparte. El gate_docs() en sí (clarify cuando ningún doc domina y hay 2
+    cerca; restrict_to cuando uno domina con confianza) se verifica con datos reales en
+    `ambiguedad_falso_positivo_confianza_alta` más abajo -- este corpus no tiene un caso donde 2
+    documentos DISTINTOS crucen min_score a la vez para probar el camino "clarify" con datos reales.
   expect: "no debería inventar una política que mezcle las dos cosas"
+  expect_clarify: false
   variants:
     - ["¿Puedo trabajar desde casa los sábados?"]
     - ["¿El sábado puedo hacer home office?"]
@@ -558,3 +561,27 @@
   turns:
     - "¿A qué se dedica la empresa?"
     - "¿cómo?"
+
+# ============================================================================
+# Gate de ambigüedad/confianza (voice/guardrails.py: gate_docs(), rediseñado 24/09) -- ver README.
+# Motivador: prueba en vivo, "¿La oficina abre los martes?" pedía aclaración entre oficina.md y
+# recursos_humanos.md con top1=oficina.md@0.38 (claramente dominante) -- BUG real, no solo de
+# calibración: best_per_doc usaba 0.0 como score default para un doc con hit único NEGATIVO,
+# achicando el gap artificialmente (0.38-0.0=0.38 en vez del real 0.38-(-0.15)=0.53). Arreglado
+# el bug Y rediseñada la lógica: alta confianza en el top-1 restringe el CONTEXTO a ese documento
+# en vez de solo evitar la aclaración -- eso es lo que previene la mezcla de políticas de verdad.
+# ============================================================================
+
+- id: ambiguedad_falso_positivo_confianza_alta
+  split: validation
+  note: >
+    conversación real (24/09) que expuso el bug del gate -- ver el bloque de arriba. ANTES: pedía
+    aclaración entre "horarios y logística de oficina" y "políticas de recursos humanos" pese a que
+    oficina.md dominaba con claridad (0.38 vs -0.15). DESPUÉS: alta confianza en oficina.md
+    restringe el CONTEXTO a sus chunks solamente (recursos_humanos.md se descarta aunque haya
+    cruzado min_score) y responde directo, sin preguntar.
+  expect: "debe responder directamente sobre el horario de martes (día de semana, lunes a viernes), sin pedir aclaración"
+  expect_clarify: false
+  expect_context_restricted_to: "oficina.md"
+  turns:
+    - "¿La oficina abre los martes?"

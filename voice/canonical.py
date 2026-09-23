@@ -18,6 +18,7 @@ from pathlib import Path
 import yaml
 
 from .config import ROOT, CanonicalCfg, resolve
+from .guardrails import lint_for_voice
 
 
 class CanonicalValidationError(Exception):
@@ -32,34 +33,9 @@ class CanonicalEntry:
     respuestas: list[str]
 
 
-# ============================================================================
-# Lint para voz (warnings, NO bloquean la carga) -- el texto de cada respuesta lo lee Piper en voz
-# alta, así que lo que es válido para texto escrito puede sonar mal hablado.
-# ============================================================================
-
-_DIGIT_RE = re.compile(r"\d")
-_TIME_RANGE_RE = re.compile(r"\d+\s*[-–]\s*\d+|\bhs\.?\b", re.IGNORECASE)
-_ABBREV_RE = re.compile(r"\b(av|ud|uds|sr|sra|dr|dra|etc|nro|n°|c/u|ej|pág|tel)\.", re.IGNORECASE)
-_MARKDOWN_RE = re.compile(r"^\s*[-*•]\s|\*\*[^*]+\*\*|__[^_]+__|^\s*\d+\.\s", re.MULTILINE)
-_MAX_WORDS_RESPONSE = 80
+# Lint para voz (warnings, NO bloquean la carga): reusa voice/guardrails.py: lint_for_voice (antes
+# duplicado acá) -- el mismo lint que valida el mensaje de aclaración del gate de ambigüedad.
 _LENGTH_VARIANCE_RATIO = 2.0  # si la variante más larga tiene más del doble de palabras que la más corta
-
-
-def _lint_response(entry_id: str, idx: int, text: str) -> list[str]:
-    label = f"{entry_id} (respuesta {idx + 1})"
-    warnings = []
-    if _DIGIT_RE.search(text):
-        warnings.append(f"{label}: tiene dígitos -- Piper lee mejor los números escritos en palabras ('diez' en vez de '10')")
-    if _TIME_RANGE_RE.search(text):
-        warnings.append(f"{label}: parece tener un formato tipo '9-13hs' -- escribilo como se pronuncia ('de nueve a trece horas')")
-    if _ABBREV_RE.search(text):
-        warnings.append(f"{label}: tiene una abreviatura -- escribila completa, Piper no las expande (leería 'av' o 'sr' tal cual)")
-    if _MARKDOWN_RE.search(text):
-        warnings.append(f"{label}: tiene viñetas o markdown -- esto se lee en voz alta, no se muestra como texto")
-    n_words = len(text.split())
-    if n_words > _MAX_WORDS_RESPONSE:
-        warnings.append(f"{label}: tiene {n_words} palabras (más de {_MAX_WORDS_RESPONSE}) -- una respuesta hablada debería ser más corta")
-    return warnings
 
 
 def lint_entry(entry: CanonicalEntry) -> list[str]:
@@ -67,7 +43,7 @@ def lint_entry(entry: CanonicalEntry) -> list[str]:
     (CanonicalMatcher.__init__), no impiden que la entrada se use."""
     warnings: list[str] = []
     for i, r in enumerate(entry.respuestas):
-        warnings += _lint_response(entry.id, i, r)
+        warnings += lint_for_voice(r, label=f"{entry.id} (respuesta {i + 1})")
     lens = [len(r.split()) for r in entry.respuestas]
     if len(lens) > 1 and max(lens) / max(min(lens), 1) > _LENGTH_VARIANCE_RATIO:
         warnings.append(

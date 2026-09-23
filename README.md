@@ -902,6 +902,70 @@ formulaciones nuevas probadas, 3 cayeron por debajo del umbral calibrado (near-m
    `python scripts/calibrate.py` de nuevo -- el umbral (`canonical.threshold`) está calibrado contra
    el contenido ANTERIOR, y agregar o sacar entradas puede correr los scores de las demás.
 
+## Rediseño del gate de ambigüedad (24/09): cercanía de scores no implica ambigüedad
+
+Prueba en vivo: **"¿La oficina abre los martes?"** con `top1=oficina.md@0.38` (claramente por
+encima de `min_score`) igual pedía aclaración entre "oficina" y "recursos humanos".
+
+**Bug real, no solo de calibración**: `_best_per_doc()` (antes `ambiguous_docs`) usaba `0.0` como
+score default en `max(best_per_doc.get(source, 0.0), score)` -- para un documento cuyo único hit
+tiene score **negativo**, eso lo dejaba "flotando" en 0.0 en vez de su score real.
+`recursos_humanos.md` tenía un solo hit en -0.15, pero el bug lo veía como 0.0 -- achicando el gap
+real (0.38 - (-0.15) = 0.53) a uno falso (0.38 - 0.0 = 0.38), por debajo del umbral. Arreglado con
+`float("-inf")` como default.
+
+**Pero arreglar el bug de cálculo no alcanzaba** -- el diseño en sí asumía que cercanía de scores
+entre dos documentos implica ambigüedad, y eso no es cierto: pueden ser complementarios (uno
+genuinamente relevante, el otro apenas "no descartable"), no necesariamente en conflicto.
+`voice/guardrails.py: gate_docs()` (reemplaza a `ambiguous_docs`) separa dos decisiones antes
+mezcladas en una:
+
+1. **Confianza alta** (`top1 >= min_score + confidence_margin`, nuevo parámetro PROVISORIO en
+   config): el CONTEXTO se restringe a los chunks de **ese** documento solamente, descartando
+   cualquier otro que haya cruzado `min_score` de casualidad -- sin preguntar nada. Esto es lo que
+   previene la mezcla de políticas (el bug original que motivó el gate viejo) de verdad, en vez de
+   solo evitar la pregunta de aclaración.
+2. Solo si **ningún** documento tiene confianza alta y los dos mejores (de documentos DISTINTOS)
+   están a menos de `ambiguity_threshold`: pedir aclaración -- ahí sí, ninguno domina con claridad.
+3. Ninguno de los dos casos: sigue el camino de siempre (CONTEXTO con los hits tal cual).
+
+`confidence_margin=0.8` es PROVISORIO, sin calibrar con `scripts/calibrate.py` -- este corpus no
+tiene todavía un caso real de 2 documentos genuinamente en conflicto para calibrar el camino
+"clarify" con datos (verificado con un test sintético de `gate_docs()`, ver
+`tests/eval_questions.yaml`). Revisar cuando haya documentos reales con temas que sí se solapen.
+
+**Traza ampliada**: `Turn.retrieval_trace` ahora guarda también el top-2 (documento y score), no
+solo el top-1 -- para poder ver qué compite, aunque no haya cruzado `min_score`.
+
+**Mensaje de aclaración**: los nombres de tema (`rag.doc_topics`, config) tenían una sigla con
+puntuación doble ("políticas de RR.HH.") -- cambiado a "políticas de recursos humanos".
+`voice/guardrails.py: lint_for_voice()` (compartido con el lint de respuestas canónicas, antes
+duplicado) ahora también detecta siglas (mayúsculas + punto) y puntuación doble/muy junta;
+`scripts/eval.py` lo corre contra `doc_topics` y una muestra de `clarify_reply()` al arrancar,
+como warning (no bloquea).
+
+**Antes/después, verificado con `scripts/eval.py`** (`expect_clarify` / `expect_context_restricted_to`,
+aserciones automáticas):
+- `ambiguedad_falso_positivo_confianza_alta` (nuevo, la conversación real): antes pedía aclaración
+  de más; después responde directo, CONTEXTO restringido a `oficina.md` solamente.
+- `retrieval_ambiguo_dos_docs` (las 3 variantes): sin cambio -- con la calibración actual, ningún
+  segundo documento cruza `min_score` para estas preguntas puntuales, así que nunca llegaban (ni
+  antes ni ahora) a la comparación de 2 documentos. La variante 3 sigue con "bug A" (el LLM
+  malinterpreta el único chunk recuperado) -- no es un problema del gate ni de retrieval.
+
+**Latencia de Piper, desglosada**: la traza mostraba ~2s sin explicar en un turno de aclaración
+(stt 0.78s + rag 0.56s vs. 3.47s a primer audio, sin LLM de por medio). Causa: `_fixed_reply()`
+(usado para abstención, aclaración, canónicas-solas y "repetí") pasaba el texto de respuesta
+**completo** a `StreamingSpeaker.say()` de una vez -- Piper sintetizaba el mensaje entero antes de
+que saliera el primer audio, a diferencia del camino de generación del LLM (que ya sintetizaba
+frase por frase). `Assistant._say_text()` (nuevo, usa `tts.iter_sentences`) ahora parte el texto en
+frases para los tres caminos (fijos, canónicas, notas de sub-preguntas no resueltas) igual que el
+LLM. `StreamingSpeaker.synth_ms` (nuevo) guarda el tiempo de síntesis por frase; `Turn.t_tts_total`/
+`t_tts_first` lo exponen en la traza y en `print_metrics`. Medido con el mensaje de aclaración real
+(dos oraciones): con el split, el primer audio sale a los ~1.22s (tiempo de la PRIMERA oración
+sola) en vez de ~1.58s (las dos oraciones juntas) -- mejora real, aunque la reducción total depende
+del largo de cada oración individual, no es gratis para mensajes con una primera oración larga.
+
 ## Estructura
 
 ```

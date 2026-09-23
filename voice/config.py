@@ -52,7 +52,11 @@ class RagCfg:
     top_k: int = 3
     min_score: float = 0.30    # en escala del reranker si reranker_enabled, si no coseno (0-1)
     chunk_chars: int = 500
-    ambiguity_threshold: float = 0.08  # ver voice/guardrails.py: ambiguous_docs() -- misma escala
+    ambiguity_threshold: float = 0.08  # ver voice/guardrails.py: gate_docs() -- misma escala
+    # PROVISORIO -- margen (sobre min_score) que un doc necesita para contar como "confianza alta"
+    # y restringir el CONTEXTO a sus chunks solamente, en vez de arriesgarse a mezclar con otro doc
+    # que cruzó min_score de casualidad. Ver voice/guardrails.py: gate_docs() y README.
+    confidence_margin: float = 0.8
     doc_topics: dict = field(default_factory=dict)  # "archivo.md" -> "nombre de tema" para el gate
     reranker_enabled: bool = True
     reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"

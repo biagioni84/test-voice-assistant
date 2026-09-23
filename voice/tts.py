@@ -75,6 +75,8 @@ class StreamingSpeaker:
         self._q: queue.Queue = queue.Queue()
         self.first_audio_at: float | None = None  # time.monotonic() del primer audio listo
         self.collected: list[np.ndarray] = []      # para guardar a WAV / tests
+        self.synth_ms: list[float] = []            # tiempo de síntesis por frase, en orden -- para
+                                                     # desglosar la latencia (ver voice/pipeline.py)
         self._t = threading.Thread(target=self._run, daemon=True)
         self._t.start()
 
@@ -90,7 +92,9 @@ class StreamingSpeaker:
         while True:
             s = self._q.get()
             try:
+                t0 = time.monotonic()
                 audio = self.tts.synth(clean_for_speech(s))
+                self.synth_ms.append((time.monotonic() - t0) * 1000)
                 if self.first_audio_at is None:
                     self.first_audio_at = time.monotonic()
                 self.collected.append(audio)

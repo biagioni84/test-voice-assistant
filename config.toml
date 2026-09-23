@@ -58,19 +58,23 @@ reranker_candidates = 5
 # vez que calibration.toml exista -- volvé a correr calibrate.py en cambio. Valores acá: el default
 # documentado para un checkout nuevo sin calibración corrida todavía.
 min_score = 0.0             # bajo este score del reranker no se inyecta contexto
-ambiguity_threshold = 0.5   # si los 2 docs con mejor score (ambos ya sobre min_score) están a menos
-                            # que esto, se pide aclaración en vez de generar. Con el reranker, rara
-                            # vez quedan 2 candidatos parejos Y ambos sobre min_score a la vez -- se
-                            # resuelven antes, por abstención (ningún doc puntúa positivo) o por un
-                            # solo candidato claramente mejor (ver README: se probó forzar min_score
-                            # más bajo para que el gate de ambigüedad tuviera más candidatos, y trajo
-                            # un problema peor -- falsos positivos de ambigüedad en preguntas de un
-                            # solo tema). Este umbral queda para el caso genuino de 2 candidatos
-                            # fuertes y parejos; revisar si aparece más seguido con documentos reales.
+# gate_docs() (voice/guardrails.py, rediseñado 24/09 -- ver README): cercanía de scores entre dos
+# documentos NO implica ambigüedad por sí sola, pueden ser complementarios. confidence_margin
+# decide primero si el top-1 "domina con claridad" (min_score + confidence_margin): si sí, el
+# CONTEXTO se restringe a SOLO ese documento (evita mezclar políticas sin tener que preguntar).
+# Solo si NINGÚN doc tiene confianza alta Y los dos mejores (de documentos distintos) están a
+# menos de ambiguity_threshold, se pide aclaración.
+confidence_margin = 0.8     # PROVISORIO -- sin suficientes casos de ambigüedad genuina en este
+                            # corpus chico para calibrar con scripts/calibrate.py; revisar cuando
+                            # haya documentos reales con temas que sí se solapen de verdad.
+ambiguity_threshold = 0.5   # si los 2 docs con mejor score (ninguno con confianza alta) están a
+                            # menos que esto, se pide aclaración en vez de generar.
 
-[rag.doc_topics]            # nombres de tema para el mensaje de aclaración del gate de ambigüedad
+[rag.doc_topics]            # nombres de tema para el mensaje de aclaración del gate -- legibles
+                            # para voz (sin siglas, sin puntuación doble: pasan por
+                            # guardrails.lint_for_voice, ver README). NO son títulos de archivo.
 "oficina.md" = "horarios y logística de oficina"
-"recursos_humanos.md" = "políticas de RR.HH."
+"recursos_humanos.md" = "políticas de recursos humanos"
 "soporte_tecnico.md" = "soporte técnico"
 
 [llm]

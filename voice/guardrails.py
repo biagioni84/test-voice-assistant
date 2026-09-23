@@ -1,7 +1,11 @@
-"""Reglas deterministas (no generadas por el LLM) para dos fallas encontradas con scripts/eval.py
-(ver README): inventar identidades/hechos cuando no hay CONTEXTO de RAG, y fugas de idioma (el 3B
-a veces cambia a chino a mitad de una respuesta, sin relación con el RAG)."""
+"""Reglas deterministas (no generadas por el LLM) para varias fallas encontradas con
+scripts/eval.py y en vivo (ver README): inventar identidades/hechos cuando no hay CONTEXTO de RAG,
+fugas de idioma (el 3B a veces cambia a chino a mitad de una respuesta, sin relación con el RAG), y
+mezclar/pedir aclaración de más entre documentos que en realidad no compiten de verdad."""
+from __future__ import annotations
+
 import re
+from dataclasses import dataclass
 
 CJK_RE = re.compile(
     "[\U00003000-\U0000303F\U00003040-\U0000309F\U000030A0-\U000030FF"
@@ -78,33 +82,106 @@ def abstain_partial_reply(subquestion: str) -> str:
     return f"No tengo información para responder esto: {subquestion}"
 
 
-def ambiguous_docs(hits: list, threshold: float) -> tuple[str, str] | None:
-    """Si los dos documentos DISTINTOS con mejor score (no necesariamente los hits en posición 1 y
-    2 -- si el top-2 son del mismo doc, se ignoran entre sí y se compara contra el mejor de otro
-    doc) están a menos de `threshold` de diferencia, devuelve (doc1, doc2) para pedir aclaración en
-    vez de generar. Si no hay ambigüedad (o hay un solo doc representado), None.
-
-    No cubre todos los casos de "el modelo mezcla mal el CONTEXTO" -- solo el patrón específico de
-    dos documentos con evidencia comparable. Si un solo doc tiene un match débil-pero-por-encima-
-    del-umbral y el modelo igual alucina con él, esto no lo agarra (ver README, caso
-    retrieval_ambiguo_dos_docs variante 1)."""
+def _best_per_doc(hits: list) -> dict[str, float]:
+    """Mejor score por documento distinto. BUG real (24/09, ver README): usar 0.0 como default en
+    max(best_per_doc.get(source, 0.0), score) hacía que un doc cuyo ÚNICO hit tuviera score
+    NEGATIVO quedara "flotando" en 0.0 en vez de su score real -- eso achicaba artificialmente el
+    gap contra el top-1 y disparaba el gate de ambigüedad de más ("¿La oficina abre los martes?":
+    oficina.md@0.38 vs. recursos_humanos.md@-0.15 con un solo hit débil, gap real 0.53, pero el
+    bug lo veía como 0.38 - 0.0 = 0.38, por debajo del umbral). float("-inf") como default deja el
+    score real, sea cual sea el signo."""
     best_per_doc: dict[str, float] = {}
     for h in hits:
-        best_per_doc[h.source] = max(best_per_doc.get(h.source, 0.0), h.score)
-    ranked = sorted(best_per_doc.items(), key=lambda kv: -kv[1])
+        best_per_doc[h.source] = max(best_per_doc.get(h.source, float("-inf")), h.score)
+    return best_per_doc
+
+
+@dataclass
+class DocGate:
+    """Resultado de gate_docs() -- a lo sumo uno de los dos campos no es None (o ninguno, caso
+    "seguir normal"). Ver voice/pipeline.py: Assistant.answer()."""
+    clarify: tuple[str, str] | None = None   # (doc1, doc2) -- pedir aclaración, no generar
+    restrict_to: str | None = None            # nombre de doc -- alta confianza: usar SOLO sus chunks
+
+
+def gate_docs(hits: list, min_score: float, confidence_margin: float, ambiguity_threshold: float) -> DocGate:
+    """Rediseño (24/09, ver README) del viejo `ambiguous_docs`: que dos documentos tengan scores
+    parecidos NO significa que sean conflictivos -- pueden ser complementarios (uno relevante, el
+    otro apenas "no descartable"), y forzar una aclaración ahí molesta al usuario sin necesidad. Al
+    revés: la cercanía SÍ importa cuando ninguno de los dos domina con claridad.
+
+    Tres salidas posibles, en este orden de prioridad:
+      1. El top-1 supera min_score + confidence_margin ("confianza alta"): DocGate(restrict_to=doc1)
+         -- el CONTEXTO se arma solo con chunks de ESE documento, ignorando cualquier otro doc que
+         haya cruzado min_score de pura casualidad. Esto es lo que evita la mezcla de políticas
+         (el bug original que motivó el viejo gate) SIN tener que preguntar nada.
+      2. Si no hay confianza alta, pero los dos mejores docs DISTINTOS están a menos de
+         `ambiguity_threshold` de diferencia: DocGate(clarify=(doc1, doc2)) -- ahí sí, ninguno
+         domina con claridad, pedir aclaración es lo honesto.
+      3. Ninguno de los dos casos: DocGate() vacío -- sigue el camino de siempre (CONTEXTO con los
+         hits tal como vinieron, sin restringir ni aclarar)."""
+    ranked = sorted(_best_per_doc(hits).items(), key=lambda kv: -kv[1])
+    if not ranked:
+        return DocGate()
+    doc1, s1 = ranked[0]
+    if s1 >= min_score + confidence_margin:
+        return DocGate(restrict_to=doc1)
     if len(ranked) < 2:
-        return None
-    (doc1, s1), (doc2, s2) = ranked[0], ranked[1]
-    if s1 - s2 < threshold:
-        return doc1, doc2
-    return None
+        return DocGate()
+    doc2, s2 = ranked[1]
+    if s1 - s2 < ambiguity_threshold:
+        return DocGate(clarify=(doc1, doc2))
+    return DocGate()
 
 
 def clarify_reply(doc1: str, doc2: str, doc_topics: dict[str, str]) -> str:
-    """Pregunta de aclaración nombrando los dos temas en juego (ver ambiguous_docs)."""
+    """Pregunta de aclaración nombrando los dos temas en juego (ver gate_docs). Los nombres de tema
+    salen de `doc_topics` (config, legibles para voz -- NO los nombres de archivo) y deberían pasar
+    lint_for_voice() sin warnings (sin siglas, sin puntuación doble, ver README)."""
     t1 = doc_topics.get(doc1, doc1)
     t2 = doc_topics.get(doc2, doc2)
     return f"Tu pregunta toca dos temas distintos: {t1} y {t2}. ¿Sobre cuál de los dos te referís?"
+
+
+# ============================================================================
+# Lint para voz -- texto que va a pasar por Piper (respuestas canónicas, mensajes de aclaración).
+# Compartido con voice/canonical.py (antes duplicado ahí).
+# ============================================================================
+
+_DIGIT_RE = re.compile(r"\d")
+_TIME_RANGE_RE = re.compile(r"\d+\s*[-–]\s*\d+|\bhs\.?\b", re.IGNORECASE)
+_ABBREV_RE = re.compile(r"\b(av|ud|uds|sr|sra|dr|dra|etc|nro|n°|c/u|ej|pág|tel)\.", re.IGNORECASE)
+_MARKDOWN_RE = re.compile(r"^\s*[-*•]\s|\*\*[^*]+\*\*|__[^_]+__|^\s*\d+\.\s", re.MULTILINE)
+# siglas ("RR.HH.", "S.A.") -- 2+ mayúsculas seguidas de un punto; se lee mal en voz alta letra por
+# letra, y encadenadas ("RR.HH.") además dejan puntuación muy junta
+_SIGLA_RE = re.compile(r"\b[A-ZÁÉÍÓÚÑ]{2,}\.")
+# puntuación doble/repetida ("..", "R.H.", dos signos de cierre pegados)
+_DOUBLE_PUNCT_RE = re.compile(r"[.,;:!?]{2,}|\.\s*[A-ZÁÉÍÓÚÑ]{1,3}\.")
+_MAX_WORDS_VOICE = 80
+
+
+def lint_for_voice(text: str, label: str = "") -> list[str]:
+    """Warnings de estilo para texto que Piper va a leer en voz alta -- no bloquean nada, son para
+    que alguien (técnico o no) revise antes de usar el texto. `label` es un prefijo libre para
+    identificar de qué texto vienen los warnings (p.ej. el id de una entrada canónica)."""
+    p = f"{label}: " if label else ""
+    warnings = []
+    if _DIGIT_RE.search(text):
+        warnings.append(f"{p}tiene dígitos -- Piper lee mejor los números escritos en palabras ('diez' en vez de '10')")
+    if _TIME_RANGE_RE.search(text):
+        warnings.append(f"{p}parece tener un formato tipo '9-13hs' -- escribilo como se pronuncia ('de nueve a trece horas')")
+    if _ABBREV_RE.search(text):
+        warnings.append(f"{p}tiene una abreviatura -- escribila completa, Piper no las expande")
+    if _SIGLA_RE.search(text):
+        warnings.append(f"{p}tiene una sigla (mayúsculas + punto) -- se lee letra por letra, mejor escribirla completa")
+    if _DOUBLE_PUNCT_RE.search(text):
+        warnings.append(f"{p}tiene puntuación doble o muy junta (p.ej. 'RR.HH.') -- revisar")
+    if _MARKDOWN_RE.search(text):
+        warnings.append(f"{p}tiene viñetas o markdown -- esto se lee en voz alta, no se muestra como texto")
+    n_words = len(text.split())
+    if n_words > _MAX_WORDS_VOICE:
+        warnings.append(f"{p}tiene {n_words} palabras (más de {_MAX_WORDS_VOICE}) -- una respuesta hablada debería ser más corta")
+    return warnings
 
 
 # Gramática GBNF para prevenir la fuga de idioma (Qwen a veces cambia a chino a mitad de una

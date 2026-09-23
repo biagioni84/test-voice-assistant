@@ -35,6 +35,7 @@ rewrite_latencies_ms: list[float] = []  # se llena en run_case(), se reporta al 
 subq_check_failures: list[str] = []  # casos con expect_n_subquestions que no dieron ese número
 history_check_failures: list[str] = []  # turnos donde self.llm.history no creció (record_turn no se llamó)
 canonical_check_failures: list[str] = []  # casos con expect_canonical_*/expect_exact_text/etc que no dieron lo esperado
+gate_check_failures: list[str] = []  # casos con expect_clarify/expect_context_restricted_to que no dieron lo esperado
 
 
 def case_variants(case: dict) -> list[tuple[str | None, list[str]]]:
@@ -134,18 +135,58 @@ def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], sh
             hits = ", ".join(f"{h.source}@{h.score:.2f}" for h in turn.context_hits)
             lines.append(f"  - RAG: {hits}")
         # distingue "no se recuperó nada" de "se recuperó con score bajo" (ver voice/pipeline.py:
-        # Turn.retrieval_trace) -- solo se muestra cuando NO hubo hits, para no duplicar la línea
-        # de arriba en el caso normal
+        # Turn.retrieval_trace) -- top1/top2 siempre (no solo sin hits): top2 es lo que compite con
+        # el top-1 para el gate de ambigüedad/confianza (ver gate_docs), aunque no haya cruzado
+        # min_score.
         for tr in turn.retrieval_trace:
+            top1 = f"{tr['top1_source']}@{tr['top1_score']:.2f}" if tr["top1_source"] else "ningún candidato"
+            top2 = f"{tr['top2_source']}@{tr['top2_score']:.2f}" if tr.get("top2_source") else "—"
             if not tr["had_hits"]:
-                top1 = f"{tr['top1_source']}@{tr['top1_score']:.2f}" if tr["top1_source"] else "ningún candidato"
-                lines.append(f"  - 🔎 {tr['subq']!r}: top1={top1} (min_score={tr['min_score']:.2f})")
+                lines.append(f"  - 🔎 {tr['subq']!r}: top1={top1} top2={top2} (min_score={tr['min_score']:.2f})")
+            elif show_chunk_text:
+                lines.append(f"  - 🔎 {tr['subq']!r}: top1={top1} top2={top2}")
         for cm in turn.canonical_matches:
             lines.append(f"  - 📌 canonical:{cm['entry_id']}@{cm['score']:.2f}")
         turn_results.append(turn)
     lines += _check_canonical_expectations(case, turn_results)
+    lines += _check_gate_expectations(case, turn_results)
     lines.append("")
     return lines
+
+
+def _check_gate_expectations(case: dict, turn_results: list) -> list[str]:
+    """Chequeos AUTOMÁTICOS sobre el gate de ambigüedad/confianza (voice/guardrails.py:
+    gate_docs(), rediseñado 24/09 -- ver README). Campos opcionales del caso, aplicados al ÚLTIMO
+    turno:
+      expect_clarify: true/false -- si el último turno debería (o no) pedir aclaración cross-doc
+        ("Tu pregunta toca dos temas distintos..." en la respuesta).
+      expect_context_restricted_to: <doc> -- el CONTEXTO del último turno debe venir SOLO de ese
+        documento (alta confianza en gate_docs restringiendo el CONTEXTO a un solo doc)."""
+    out: list[str] = []
+    cid = case["id"]
+    last = turn_results[-1]
+
+    expect_clarify = case.get("expect_clarify")
+    if expect_clarify is not None:
+        got_clarify = "toca dos temas distintos" in last.answer
+        ok = got_clarify == expect_clarify
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_clarify={expect_clarify} (obtuvo {got_clarify})")
+        if not ok:
+            gate_check_failures.append(
+                f"{cid}: expect_clarify={expect_clarify}, obtuvo clarify={got_clarify} (answer={last.answer!r})"
+            )
+
+    expect_doc = case.get("expect_context_restricted_to")
+    if expect_doc is not None:
+        docs = {h.source for h in last.context_hits}
+        ok = docs == {expect_doc}
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_context_restricted_to={expect_doc!r} (obtuvo docs={sorted(docs)!r})")
+        if not ok:
+            gate_check_failures.append(
+                f"{cid}: expect_context_restricted_to={expect_doc!r}, obtuvo docs={sorted(docs)!r}"
+            )
+
+    return out
 
 
 def _check_canonical_expectations(case: dict, turn_results: list) -> list[str]:
@@ -227,6 +268,20 @@ def main() -> None:
 
     cfg = load_config()
     cfg.wakeword.enabled = False
+
+    # lint de voz sobre los nombres de tema del gate de ambigüedad y el mensaje de aclaración que
+    # arman (ver voice/guardrails.py: lint_for_voice/clarify_reply) -- se corre una sola vez acá,
+    # no por caso, mismo espíritu que el lint de tests/canonical_answers.yaml al cargar.
+    from voice import guardrails
+    for doc, topic in cfg.rag.doc_topics.items():
+        for w in guardrails.lint_for_voice(topic, label=f"doc_topics[{doc!r}]"):
+            print(f"[lint] ⚠ {w}", flush=True)
+    if len(cfg.rag.doc_topics) >= 2:
+        sample_docs = list(cfg.rag.doc_topics)[:2]
+        sample_msg = guardrails.clarify_reply(sample_docs[0], sample_docs[1], cfg.rag.doc_topics)
+        for w in guardrails.lint_for_voice(sample_msg, label="clarify_reply (muestra)"):
+            print(f"[lint] ⚠ {w}", flush=True)
+
     bot = Assistant(cfg, speak=False)
 
     out_path = Path(args.out) if args.out else ROOT / "eval_results" / f"{datetime.datetime.now():%Y%m%d_%H%M%S}.md"
@@ -306,7 +361,7 @@ def main() -> None:
     # chequeos AUTOMÁTICOS del harness (el resto lo juzga un humano/Claude leyendo el markdown) --
     # invariantes estructurales donde SÍ hay una respuesta correcta objetiva, a diferencia de
     # "¿la respuesta está bien?".
-    all_failures = subq_check_failures + history_check_failures + canonical_check_failures
+    all_failures = subq_check_failures + history_check_failures + canonical_check_failures + gate_check_failures
     if all_failures:
         if subq_check_failures:
             print(f"\n❌ {len(subq_check_failures)} chequeo(s) de expect_n_subquestions fallaron:")
@@ -319,6 +374,10 @@ def main() -> None:
         if canonical_check_failures:
             print(f"\n❌ {len(canonical_check_failures)} chequeo(s) de respuestas canónicas fallaron:")
             for f in canonical_check_failures:
+                print(f"   - {f}")
+        if gate_check_failures:
+            print(f"\n❌ {len(gate_check_failures)} chequeo(s) del gate de ambigüedad/confianza fallaron:")
+            for f in gate_check_failures:
                 print(f"   - {f}")
         sys.exit(1)
 

@@ -12,8 +12,8 @@ from .config import Config
 from .guardrails import (
     abstain_partial_reply,
     abstain_reply,
-    ambiguous_docs,
     clarify_reply,
+    gate_docs,
     is_chitchat,
     is_repeat_request,
 )
@@ -46,6 +46,8 @@ class Turn:
     t_llm_first_token: float = 0.0
     t_llm_total: float = 0.0
     n_tokens: int = 0
+    t_tts_total: float = 0.0     # suma de todo lo que tardó Piper en sintetizar (todas las frases)
+    t_tts_first: float = 0.0     # lo que tardó Piper en sintetizar SOLO la primera frase
     t_first_audio: float = 0.0   # desde que terminó de hablar el usuario hasta el primer audio
     audio: np.ndarray | None = None
     sample_rate: int = 0
@@ -91,6 +93,18 @@ class Assistant:
         text = self.stt.transcribe(audio)
         return text, time.monotonic() - t
 
+    @staticmethod
+    def _say_text(out: StreamingSpeaker, text: str) -> None:
+        """Encola `text` para hablar, partido en frases (ver tts.iter_sentences) -- NO como un solo
+        bloque. BUG real (24/09, ver README): _fixed_reply pasaba el texto completo a out.say() de
+        una vez, así que Piper sintetizaba el mensaje ENTERO antes de que saliera el primer audio
+        -- para el mensaje de aclaración (dos oraciones) esto medía ~2s de latencia extra,
+        indistinguible en la traza de otra cosa hasta que se desglosó el tiempo de síntesis (ver
+        StreamingSpeaker.synth_ms). Partir en frases dispara la síntesis de la primera apenas está
+        lista, igual que ya hacía el camino de generación del LLM."""
+        for sentence in iter_sentences(iter([text])):
+            out.say(sentence)
+
     def _fixed_reply(self, question: str, answer_text: str, turn: Turn, t0: float) -> Turn:
         """Corta acá sin llamar al LLM de respuesta (ver voice/guardrails.py): usado tanto para la
         abstención (sin CONTEXTO) como para el gate de ambigüedad cross-doc (dos documentos con
@@ -98,11 +112,13 @@ class Assistant:
         a inventar identidades (bug 'Juan Carlos es el Rey de España', ver README)."""
         out = StreamingSpeaker(self.tts, self.speaker)
         print(f"🤖 {answer_text}", flush=True)
-        out.say(answer_text)
+        self._say_text(out, answer_text)
         out.finish()
         self.llm.record_turn(question, answer_text)
         self._last_answer = answer_text
         turn.answer = answer_text
+        turn.t_tts_total = sum(out.synth_ms) / 1000
+        turn.t_tts_first = (out.synth_ms[0] / 1000) if out.synth_ms else 0.0
         if out.first_audio_at:
             turn.t_first_audio = out.first_audio_at - t0
         if out.collected:
@@ -160,20 +176,27 @@ class Assistant:
             t = time.monotonic()
             hits = self.rag.retrieve(subq) if self.rag else []
             turn.t_rag += time.monotonic() - t
-            all_hits += hits
 
             if self.rag:
                 # traza de retrieval: distingue "no se recuperó nada" (ni un candidato) de "se
                 # recuperó con score bajo" (había un top-1, no cruzó min_score) -- antes ambos casos
                 # se veían igual en el log ("sin contexto"), sin poder saber cuál pasó (ver README).
-                top1 = hits[0] if hits else None
-                if top1 is None:
-                    cands = self.rag.score_candidates(subq)  # solo si no hubo hits: recalcula el
-                    top1 = cands[0] if cands else None       # top-1 sin filtrar, nada más para el log
+                # Se agrega también el top-2 (documento y score) para ver qué compite con el top-1,
+                # aunque no haya cruzado min_score -- sin esto no se veía por qué el gate de
+                # ambigüedad disparaba (ver gate_docs más abajo). Si hits ya trae 2+ (el caso
+                # normal con top_k=2) se usan esos, sin llamar de nuevo al reranker.
+                if len(hits) >= 2:
+                    top1, top2 = hits[0], hits[1]
+                else:
+                    cands = self.rag.score_candidates(subq)
+                    top1 = cands[0] if cands else None
+                    top2 = cands[1] if len(cands) > 1 else None
                 turn.retrieval_trace.append({
                     "subq": subq,
                     "top1_source": top1.source if top1 else None,
                     "top1_score": top1.score if top1 else None,
+                    "top2_source": top2.source if top2 else None,
+                    "top2_score": top2.score if top2 else None,
                     "min_score": self.cfg.rag.min_score,
                     "had_hits": bool(hits),
                 })
@@ -186,11 +209,17 @@ class Assistant:
                 continue
 
             if self.rag and hits:
-                ambiguous = ambiguous_docs(hits, self.cfg.rag.ambiguity_threshold)
-                if ambiguous:
-                    unresolved_notes.append(clarify_reply(*ambiguous, self.cfg.rag.doc_topics))
+                gate = gate_docs(hits, self.cfg.rag.min_score, self.cfg.rag.confidence_margin, self.cfg.rag.ambiguity_threshold)
+                if gate.clarify:
+                    unresolved_notes.append(clarify_reply(*gate.clarify, self.cfg.rag.doc_topics))
                     continue
+                if gate.restrict_to:
+                    # confianza alta en un solo doc: el CONTEXTO se arma solo con SUS chunks,
+                    # aunque otro doc distinto haya cruzado min_score de casualidad -- evita
+                    # mezclar políticas sin tener que preguntar (ver README, gate_docs).
+                    hits = [h for h in hits if h.source == gate.restrict_to]
 
+            all_hits += hits  # después del gate: refleja lo que REALMENTE se usó como CONTEXTO
             context = Retriever.format_context(hits) if hits else None
             resolved.append((subq, context))
 
@@ -215,7 +244,7 @@ class Assistant:
         # generar -- son instantáneas (no hay decodificación) y el LLM no las toca en absoluto.
         for part in canonical_parts:
             print(part, end=" ", flush=True)
-            out.say(part)
+            self._say_text(out, part)
 
         def counted():
             nonlocal first
@@ -249,11 +278,13 @@ class Assistant:
         # (no generadas) -- no pasaron por el LLM en absoluto (ver punto 4 del README)
         for note in unresolved_notes:
             print(note, end=" ", flush=True)
-            out.say(note)
+            self._say_text(out, note)
         print(flush=True)
         turn.answer = " ".join([*canonical_parts, generated, *unresolved_notes]).strip()
 
         out.finish()
+        turn.t_tts_total = sum(out.synth_ms) / 1000
+        turn.t_tts_first = (out.synth_ms[0] / 1000) if out.synth_ms else 0.0
         # se guarda la pregunta ORIGINAL (no la reescrita): así la próxima reescritura ve la charla
         # tal como pasó de verdad, no una versión ya "limpiada" de sí misma.
         self.llm.record_turn(question, turn.answer)
@@ -269,6 +300,7 @@ class Assistant:
         print(
             f"   ⏱ stt {t.t_stt:.2f}s | rewrite {t.t_rewrite * 1000:.0f}ms | rag {t.t_rag * 1000:.0f}ms | "
             f"llm 1er token {t.t_llm_first_token:.2f}s, {t.n_tokens} tok @ {tps:.1f} tok/s | "
+            f"tts total {t.t_tts_total * 1000:.0f}ms (1ra frase {t.t_tts_first * 1000:.0f}ms) | "
             f"fin de voz → 1er audio {t.t_first_audio:.2f}s",
             flush=True,
         )
@@ -279,9 +311,10 @@ class Assistant:
                 print(f"   🔎 {tr['subq']!r}: sin ningún candidato (corpus vacío o embedding sin match)", flush=True)
             else:
                 status = "✓ recuperado" if tr["had_hits"] else "✗ NO cruzó min_score"
+                top2 = f"{tr['top2_source']}@{tr['top2_score']:.2f}" if tr.get("top2_source") else "—"
                 print(
                     f"   🔎 {tr['subq']!r}: top1={tr['top1_source']}@{tr['top1_score']:.2f} "
-                    f"(min_score={tr['min_score']:.2f}) {status}",
+                    f"top2={top2} (min_score={tr['min_score']:.2f}) {status}",
                     flush=True,
                 )
 
