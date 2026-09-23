@@ -484,6 +484,12 @@ todo lo malo (incluido el near-miss que antes se colaba) queda abajo, sin zona g
 subió a 0.5 (en esta escala, un gap chico entre dos candidatos que *ya* pasaron `min_score` -- no
 apareció ningún caso así en los datos disponibles, revisar si aparece en uso real).
 
+*(Esta calibración de `min_score=0.0`/`ambiguity_threshold=0.5` fue manual, a mano contra los casos
+de arriba -- quedó documentada acá como historia de cómo se llegó a la escala del reranker, pero
+dejó de ser el mecanismo vigente: ver "Independencia de los documentos" más abajo. El valor que
+efectivamente se usa hoy sale de `calibration.toml`, generado por `scripts/calibrate.py` contra un
+set etiquetado, no de estos números.)*
+
 **Resultado, antes → después:**
 
 | Caso | Antes (coseno + gate) | Después (reranker) |
@@ -491,7 +497,7 @@ apareció ningún caso así en los datos disponibles, revisar si aparece en uso 
 | `comentario_sin_tema_no_corta_continuidad` (near-miss) | ✗ alucinaba citando soporte_tecnico.md | ✓ **arreglado del todo** -- sin contexto, respuesta correcta |
 | `retrieval_ambiguo_dos_docs` variantes 1 y 2 | pedían aclaración (gate viejo, con falsos positivos en otros casos) | ✓ **abstienen** ("No tengo información sobre eso") -- ningún doc puntúa positivo, más honesto que forzar una aclaración |
 | `retrieval_ambiguo_dos_docs` variante 3 | alucinaba mezclando 2 docs | recupera 1 solo doc (correcto), pero el LLM **sigue malinterpretándolo** (invierte martes/jueves) -- ya no es mezcla de docs, es "bug A" puro |
-| `pregunta_compuesta` | con el gate viejo daba falso positivo; sin gate, respondía bien | ✗ **regresión nueva**: el chunk correcto (tiene las dos partes de la respuesta) puntúa **-0.66** con el reranker para esta frase imperativa/compuesta ("Decime X y también Y") -- por debajo de `min_score`, así que abstiene en vez de responder. Confirma exactamente lo que anticipaba el pedido original: esto no es un problema de umbral, es que la pregunta pide DOS datos y ningún chunk aislado los tiene juntos de una forma que el reranker reconozca bien para frases compuestas -- el caso motivador real para la descomposición de preguntas compuestas (siguiente sección). |
+| `pregunta_compuesta` | con el gate viejo daba falso positivo; sin gate, respondía bien | ✗ regresión: el chunk correcto (tiene las dos partes) puntúa **-0.66** para esta frase compuesta/imperativa -- por debajo de `min_score`, abstiene en vez de responder. No es un problema de umbral: la pregunta pide DOS datos y ningún chunk aislado los tiene juntos de una forma que el reranker reconozca bien para frases compuestas. **Arreglado más abajo** (sección "Descomposición de preguntas compuestas") separando en sub-preguntas antes del retrieval, en vez de tocar `min_score`. |
 
 ## Testear el LLM/RAG con scripts/eval.py
 
@@ -545,19 +551,151 @@ El "cambio de día en un follow-up" que quedaba roto ahí se arregló con la ree
 ver esa sección más arriba. El estado actual, más las rondas de latencia/dev-validación/chunking, está
 resumido abajo.)*
 
-**Estado actual (23/09, `tests/eval_questions.yaml`, ~64 turnos entre dev y validación):**
+**Estado actual (22/09/2026, `tests/eval_questions.yaml`, 76 turnos entre dev y validación, con el
+reranker + calibración + descomposición de preguntas compuestas):**
 
 | Área | Estado |
 |---|---|
 | Horarios, contraseña, vacaciones, trabajo remoto, consistencia, grosería (control) | ✓ sin regresión |
 | Cambio de día en follow-up (5 variantes, antes roto) | ✓ **5/5** con la reescritura de consulta |
 | Identidad inventada, nombre común, multi-turno, chiste (guardrails deterministas) | ✓ sin regresión |
-| Validación holdout (formulaciones nuevas, no usadas para ajustar el prompt) | 2/4 generalizan bien; 2/4 no resuelven pero abstienen seguro (nunca alucinan) |
-| Cross-doc ambiguo (gate nuevo) | 2/3 piden aclaración correctamente; 1/3 sigue siendo bug de fidelidad al contexto, no de ambigüedad |
-| `pregunta_compuesta` | falso positivo conocido del gate de ambigüedad (ver arriba) |
-| `comentario_sin_tema_no_corta_continuidad` (turno del medio) | regresión nueva del chunking más fino (ver arriba) |
+| Validación holdout de reescritura (formulaciones nuevas, no usadas para ajustar el prompt) | 2/4 generalizan bien; 2/4 no resuelven pero abstienen seguro (nunca alucinan) |
+| Cross-doc ambiguo (`retrieval_ambiguo_dos_docs`) | 2/3 abstienen honestamente (ningún doc solo cruza claro); 1/3 recupera 1 doc correcto pero el LLM lo malinterpreta -- "bug A", no de retrieval |
+| `pregunta_compuesta` | ✓ **arreglado** con la descomposición (punto 4, ver esa sección) -- responde ambas partes |
+| Descomposición, 4 casos nuevos de validación (primer turno, seguimiento, parte fuera de dominio, imperativa) | ✓ **4/4** |
+| Falsos positivos del pre-filtro de preguntas compuestas sobre preguntas no-compuestas | 1/63 (2%) |
+| `comentario_sin_tema_no_corta_continuidad` (turno del medio) | ✓ sin regresión |
+| 0 caracteres CJK en toda la corrida | ✓ |
 
 Todo documentado con el detalle completo en `tests/eval_questions.yaml` y en las secciones de arriba.
+
+## Independencia de los documentos: calibración vs. arquitectura
+
+Los documentos de `docs/` son genéricos, de prueba -- no son los definitivos. Ajustar umbrales,
+few-shots o patrones a mano contra casos puntuales de ESOS documentos es sobreajustar: el trabajo no
+generaliza a los documentos reales cuando lleguen. La regla desde acá en adelante:
+
+- **Arquitectura estable** (no depende de qué documentos haya): el mecanismo del reescritor y la
+  descomposición de preguntas compuestas (siguiente sección), el mecanismo del reranker (candidatos
+  densos → cross-encoder → filtro), el diseño de `llama-server` con 2 slots, la categoría de
+  guardrails deterministas (`voice/guardrails.py`) y su forma de intervenir sin llamar al LLM.
+- **Parámetros provisorios, atados a `docs/`**: los valores puntuales de `rag.min_score` y
+  `rag.ambiguity_threshold`, las entradas de `[rag.doc_topics]`, y el propio dataset de
+  `tests/calibration_questions.yaml`. Estos SÍ hay que recalcular cuando cambien los documentos.
+
+**`scripts/calibrate.py`**: en vez de mover `min_score`/`ambiguity_threshold` a mano hasta que un
+caso puntual pase, el script barre umbrales candidatos contra un set etiquetado
+(`tests/calibration_questions.yaml`: preguntas marcadas `in_domain` / `out_of_domain` / `no_answer` /
+`ambiguous`) y elige el que resuelve mejor esas etiquetas, priorizando ante todo que
+`out_of_domain`/`no_answer` nunca "crucen" el umbral (el riesgo de más impacto: una respuesta
+confiada e inventada). Escribe el resultado a `calibration.toml`, que `voice/config.py` carga y
+superpone sobre los defaults de `config.toml` (`_apply_calibration`) -- así **recalibrar para
+documentos reales es correr el script de nuevo**, reescribiendo antes
+`tests/calibration_questions.yaml` con preguntas sobre esos documentos, sin tocar `config.toml` a
+mano.
+
+```bash
+.venv/bin/python scripts/calibrate.py              # calibra y escribe calibration.toml
+.venv/bin/python scripts/calibrate.py --dry-run     # solo el reporte, no escribe nada
+```
+
+**Un intento descartado, documentado porque es una lección real**: la primera versión del barrido
+exigía que una pregunta `ambiguous` tuviera **2 documentos distintos** sobre el umbral (para que el
+gate de ambigüedad, que necesita 2 candidatos, tuviera con qué disparar). Eso bajó `min_score` de
+0.0 a -1.6 -- y a ese nivel, con un corpus chico y genérico, casi cualquier chunk cruza para casi
+cualquier pregunta: preguntas de un solo tema ("¿Cuál es el horario de la oficina los sábados?")
+empezaban a mezclarse con documentos sin relación real y disparaban el gate de ambigüedad sin
+ambigüedad de verdad (se vio corriendo `scripts/eval.py` sobre `pregunta_compuesta` y los nuevos
+casos de descomposición). Cambiaba un bug (alucinar con 1 solo doc débil) por otro peor (pedir
+aclaración de más en preguntas normales). Se volvió a la versión conservadora: `min_score` se
+calibra solo para "¿hay o no hay contexto razonable?" (1+ doc alcanza también para `ambiguous`); que
+ese contexto tenga genuinamente 2 documentos en conflicto es un juicio más fino, calibrado aparte y
+por separado (`ambiguity_threshold`) -- si no hay suficientes casos para calibrarlo con los datos
+disponibles, el script lo dice explícitamente en vez de forzar un valor. Con esto, el resultado
+calibrado actual (`calibration.toml`) es `min_score ≈ -0.68` (recupera "¿Cuándo se pagan los
+sueldos?", un near-miss real que con `min_score=0.0` quedaba apenas afuera) y `ambiguity_threshold`
+sin datos suficientes para recalibrar, así que queda en el default de `config.toml` (0.5).
+
+**Recall@5 de la etapa densa** (antes del reranker): `scripts/calibrate.py` también reporta si el
+primer filtro por coseno (el que trae `reranker_candidates` candidatos para el cross-encoder) ya
+pierde el chunk correcto antes de que el reranker tenga la oportunidad de reordenarlo. *Aclaración
+importante: este proyecto no tiene retrieval híbrido (denso + BM25/léxico), solo denso* -- la
+"reescritura híbrida" mencionada como posible pendiente en una ronda anterior no existe todavía, así
+que esto mide la etapa densa contra sí misma, no un léxico. Medido contra las 9 preguntas
+`in_domain`/`ambiguous` con `expected_doc(s)`: **recall@5 = 9/9 (100%)** -- con este corpus (14
+chunks en 3 documentos), trivial de cumplir; `reranker_candidates=5` no es un cuello de botella hoy.
+Esta medición sí importa una vez que lleguen documentos reales y más grandes -- si el recall baja,
+la señal es subir `reranker_candidates` o revisar chunking/embeddings, no tocar `min_score`.
+
+**Reescritor -- stop sequences**: se agregó `stop=["?", "\n"]` a la llamada de reescritura simple
+(no a la de descomposición, que devuelve JSON) para cortar la decodificación apenas termina la
+pregunta reescrita, en vez de esperar el token EOS del modelo. Medido en un caso real
+(`rewrite_correccion_explicita`): sin stop, 12 tokens / 287.7ms; con `stop=["?","\n"]`, 11 tokens /
+250-272ms -- ahorro real pero modesto (~15%, el modelo ya paraba casi enseguida solo en este caso);
+más que nada es una red de seguridad contra divague si algún día el modelo empieza a explicar en vez
+de cortar limpio. Detalle no obvio: `llama-server` **no incluye el string de corte en la
+respuesta** (confirmado empíricamente) -- si cortó por `"?"`, el texto devuelto no lo tiene, y hay
+que reponerlo a mano o `looks_like_question()` lo rechaza siempre y se pierde la reescritura entera.
+El endpoint OpenAI-compatible tampoco distingue cuál de los dos stops se disparó (no expone
+`stopping_word` como el endpoint nativo `/completion`) -- se repone el `"?"` cuando el texto no tiene
+`"\n"` y el corte fue por `finish_reason="stop"`, una apuesta documentada en el código
+(`voice/llm.py: rewrite_query`) en vez de escondida.
+
+## Descomposición de preguntas compuestas (punto 4)
+
+Motivador: `pregunta_compuesta` ("Decime el horario de lunes a viernes y también el de los
+sábados.") -- el chunk correcto (tiene ambos datos) puntuaba negativo con el reranker para esta
+frase compuesta/imperativa, así que abstenía en vez de responder. No es un problema de umbral: la
+pregunta pide DOS datos y el reranker juzga la relevancia de la frase completa contra el chunk, no
+de cada dato por separado. La solución es separar en sub-preguntas ANTES del retrieval, para que
+cada una se juzgue contra el chunk que le corresponde.
+
+**Distinción clave**: "compuesta" (dos datos distintos, un tema -- necesita descomponerse) vs.
+"ambigua" (un dato, dos documentos en conflicto -- necesita el gate de `ambiguous_docs`). El
+coseno/reranker solos no distinguen esto; hace falta resolverlo antes, con un filtro barato.
+
+**`voice/rewrite.py: looks_compound()`** -- filtro determinista (sin LLM), evaluado en **cualquier
+turno, incluido el primero** (una pregunta compuesta puede ser la primera frase de la charla, no
+depende de que haya historial). Señales, cualquiera alcanza: dos signos de interrogación,
+conectores ("y", "además", "también"), dos palabras interrogativas distintas, marcas de
+enumeración. A propósito sesgado a favor de recall: un falso positivo solo cuesta la latencia de una
+llamada extra al reescritor en "modo descomposición", que en el peor caso devuelve una sola
+sub-pregunta. Medido contra los 63 turnos no-compuestos de `tests/eval_questions.yaml`: **1/63 (2%)
+falsos positivos** -- el pre-filtro es barato en la práctica.
+
+**Modo descomposición** (`voice/rewrite.py: DECOMPOSE_SYSTEM_PROMPT` + few-shot dedicado): el
+reescritor devuelve un array JSON de 1 a 3 sub-preguntas autónomas, cada una en forma interrogativa
+("¿Cuál es...?") -- normaliza fraseo imperativo ("decime X y también Y" → dos preguntas). Si el JSON
+no valida (`parse_subquestions`), se usa la pregunta original tal cual, sin sub-preguntas.
+
+**Por sub-pregunta, independiente** (`voice/pipeline.py: Assistant.answer()`): retrieval + reranker
++ el gate de abstención/ambigüedad de siempre corren por separado para cada una. Las que abstienen o
+dan ambiguo NO llegan al LLM de respuesta -- se resuelven con una nota fija (NO generada,
+`voice/guardrails.py: abstain_partial_reply`/`clarify_reply`) que se concatena al final. Las
+resueltas (con CONTEXTO válido, o chitchat sin CONTEXTO) van todas juntas a **una sola llamada** al
+LLM de respuesta (`LocalLLM.stream_answer_multi`).
+
+**El detalle no obvio de esa llamada única**: pedirle en prosa "respondé cada parte por separado" no
+alcanzaba -- con dos sub-preguntas que comparten el mismo CONTEXTO (pasa seguido con este corpus,
+donde un párrafo trae varios datos juntos), el 3B ignoraba una de las dos partes por completo y solo
+contestaba con el dato más "saliente" para ambas. Pedirle un formato con ancla estructural (`Parte 1:
+...`, `Parte 2: ...`, una línea por parte, obligatorio) lo resuelve de forma confiable. Esas
+etiquetas son un andamiaje interno -- se sacan (`strip_part_labels`) antes de hablar/mostrar/guardar
+la respuesta, el usuario nunca las escucha.
+
+**Verificado con `scripts/eval.py`** (agregado `compound: true` a los casos que deben disparar el
+pre-filtro, para no contarlos como falsos positivos):
+- `pregunta_compuesta` (dev): ✓ responde ambas partes.
+- 4 casos nuevos en `split: validation` (holdout, formulaciones no parecidas a los few-shot):
+  primer turno sin historial, seguimiento después de un tema sin relación, una parte fuera de
+  dominio (responde la parte con datos + nota fija para la otra, sin alucinar ni abstener de más), y
+  fraseo imperativo distinto al del few-shot ("Contame"/"de paso decime" en vez de "Decime... y
+  también"). Los 4 pasan.
+- Sin regresión en los casos no compuestos (dev + validación completos, 0 caracteres CJK en toda la
+  corrida).
+
+**Diferido a propósito** (per el pivot de documentos genéricos): lookup estructurado de horarios y
+la comparación 3B vs. 7-8B quedan para cuando existan documentos reales.
 
 ## Estructura
 
@@ -567,14 +705,24 @@ voice/
   wakeword.py   openWakeWord (ONNX)
   vad.py        Silero VAD + segmentador de frases
   stt.py        faster-whisper (GPU)
-  rag.py        chunking + embeddings + retrieval
-  llm.py        llama.cpp (CPU), streaming
+  rag.py        chunking + embeddings + retrieval + reranker
+  rewrite.py    reescritura de consulta + descomposición de preguntas compuestas
+  llm.py        llama-server (subproceso HTTP), streaming
+  guardrails.py reglas deterministas (abstención, ambigüedad, anti-CJK)
   tts.py        Piper, streaming por frase
   pipeline.py   orquesta todo (clase Assistant)
+  config.py     config.toml + calibration.toml -> dataclasses tipadas
 scripts/
   download_models.py   descarga todos los modelos
   bench.py              benchmark end-to-end sin mic
-docs/           documentos de ejemplo para el RAG (reemplazar por los reales)
+  eval.py                corre tests/eval_questions.yaml contra el LLM/RAG real
+  calibrate.py           calibra rag.min_score/ambiguity_threshold contra tests/calibration_questions.yaml
+docs/                     documentos de ejemplo para el RAG (reemplazar por los reales)
+tests/
+  eval_questions.yaml         casos de comportamiento (dev/validación) para scripts/eval.py
+  calibration_questions.yaml  set etiquetado para scripts/calibrate.py
+config.toml       arquitectura + defaults documentados
+calibration.toml  PROVISORIO, generado por scripts/calibrate.py -- pisa min_score/ambiguity_threshold
 ```
 
 ## ¿Se puede acelerar Whisper y Piper?

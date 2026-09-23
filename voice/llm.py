@@ -97,7 +97,15 @@ class LocalLLM:
             {"role": "assistant", "content": answer},
         ]
 
-    def _post(self, messages: list[dict], id_slot: int, max_tokens: int, temperature: float, stream: bool):
+    def _post(
+        self,
+        messages: list[dict],
+        id_slot: int,
+        max_tokens: int,
+        temperature: float,
+        stream: bool,
+        stop: list[str] | None = None,
+    ):
         payload = {
             "model": "local",
             "messages": messages,
@@ -108,45 +116,91 @@ class LocalLLM:
             "grammar": CJK_GRAMMAR,  # ver voice/guardrails.py: gramática en vez de logit_bias grande
             "stream": stream,
         }
+        if stop:
+            payload["stop"] = stop
         return requests.post(f"{self.base_url}/v1/chat/completions", json=payload, stream=stream, timeout=60)
 
-    def rewrite_query(self, question: str) -> tuple[str, bool]:
-        """Reescribe `question` como pregunta autónoma usando self.history. No hace nada (pasa la
-        pregunta tal cual) si no hay historial todavía -- el primer turno de la charla no paga esta
-        llamada extra. Devuelve (pregunta_a_usar, se_reescribió)."""
-        if not self.history or not self.rewrite_cfg.enabled:
-            return question, False
-
+    def _recent_pairs(self) -> list[tuple[str, str]]:
         pairs: list[tuple[str, str]] = []
         hist = self.history[-2 * self.rewrite_cfg.history_turns :]
         for i in range(0, len(hist) - 1, 2):
             pairs.append((hist[i]["content"], hist[i + 1]["content"]))
+        return pairs
+
+    def rewrite_query(self, question: str) -> tuple[list[str], bool]:
+        """Devuelve (sub_preguntas, se_reescribió_o_descompuso). Normalmente sub_preguntas trae un
+        solo elemento (comportamiento de siempre); trae más de uno solo si voice/rewrite.py:
+        looks_compound() disparó Y el reescritor devolvió una descomposición válida.
+
+        A diferencia de la reescritura de seguimiento (que no tiene sentido sin historial: no hay
+        nada que resolver), la detección de preguntas compuestas se evalúa en CUALQUIER turno,
+        incluido el primero -- "decime el horario de lunes a viernes y también el de los sábados"
+        puede ser la primera frase de la charla."""
+        if not self.rewrite_cfg.enabled:
+            return [question], False
+
+        pairs = self._recent_pairs()
+
+        if rewrite.looks_compound(question):
+            subqs = self._decompose(question, pairs)
+            if subqs is not None:
+                return subqs, True
+            # no validó (JSON roto, etc.) -- sigue el camino normal de abajo con la pregunta tal
+            # cual, que todavía puede beneficiarse de la reescritura de seguimiento si hay historial
+
+        if not self.history:
+            return [question], False
 
         if rewrite.is_empty_reference(question):
             resolved = rewrite.resolve_empty_reference(pairs)
             if resolved:
-                return resolved, True
+                return [resolved], True
 
         messages = [
             {"role": "system", "content": rewrite.SYSTEM_PROMPT},
             *rewrite.few_shot_messages(),
             {"role": "user", "content": rewrite.format_input(pairs, question)},
         ]
-        resp = self._post(messages, SLOT_REWRITE, self.rewrite_cfg.max_tokens, 0.0, stream=False).json()
-        out = resp["choices"][0]["message"]["content"].strip()
+        # stop=["?", "\n"]: corta la decodificación apenas termina la pregunta reescrita en vez de
+        # esperar el token EOS del modelo -- medido con scripts/.../test_stop.py: ahorra ~1 token y
+        # ~15-35ms en este caso (el modelo ya paraba casi enseguida solo), pero además actúa como
+        # red de seguridad si algún día empieza a divagar/explicar en vez de cortar limpio. OJO:
+        # llama-server NO incluye el string de corte en la respuesta (confirmado empíricamente) --
+        # si cortó por "?" hay que reponerlo a mano o looks_like_question() lo rechaza siempre.
+        resp = self._post(
+            messages, SLOT_REWRITE, self.rewrite_cfg.max_tokens, 0.0, stream=False, stop=["?", "\n"]
+        ).json()
+        choice = resp["choices"][0]
+        out = choice["message"]["content"].strip()
+        if choice.get("finish_reason") == "stop" and out and not out.endswith("?") and "\n" not in out:
+            # el endpoint OpenAI-compatible de llama-server no distingue CUÁL de los dos stops se
+            # disparó (no expone un "stopping_word" como el endpoint nativo /completion) -- si el
+            # texto no tiene "\n" y le falta el "?" final, la explicación más probable con mucha
+            # diferencia es que cortó justo por "?" (el few-shot condiciona fuerte a una sola línea
+            # corta terminada en "?"); reponerlo acá evita descartar reescrituras buenas solo por
+            # esta ambigüedad del endpoint. looks_like_question() igual filtra por longitud después.
+            out = out + "?"
         if rewrite.looks_like_question(out):
-            return out, True
-        return question, False
+            return [out], True
+        return [question], False
 
-    def stream_answer(self, question: str, context: str | None = None) -> Iterator[str]:
-        """Genera la respuesta para `question` (ya debería venir autónoma/reescrita si corresponde)
-        + `context` de este turno. Stateless: no lee ni actualiza self.history -- llamar a
-        record_turn() aparte con lo que corresponda guardar."""
-        user = f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}" if context else question
+    def _decompose(self, question: str, pairs: list[tuple[str, str]]) -> list[str] | None:
+        """Modo descomposición del reescritor: intenta partir `question` en 1-3 sub-preguntas
+        autónomas (ver voice/rewrite.py: DECOMPOSE_SYSTEM_PROMPT). None si el output no valida
+        (rewrite.parse_subquestions) -- el llamador cae al camino normal."""
         messages = [
-            {"role": "system", "content": self.cfg.system_prompt},
-            {"role": "user", "content": user},
+            {"role": "system", "content": rewrite.DECOMPOSE_SYSTEM_PROMPT},
+            *rewrite.decompose_few_shot_messages(),
+            {"role": "user", "content": rewrite.format_input(pairs, question)},
         ]
+        # más presupuesto que una reescritura simple: hasta 3 sub-preguntas en un array JSON
+        resp = self._post(
+            messages, SLOT_REWRITE, self.rewrite_cfg.max_tokens * 3, 0.0, stream=False
+        ).json()
+        out = resp["choices"][0]["message"]["content"].strip()
+        return rewrite.parse_subquestions(out)
+
+    def _stream_from_messages(self, messages: list[dict]) -> Iterator[str]:
         r = self._post(messages, SLOT_ANSWER, self.cfg.max_tokens, self.cfg.temperature, stream=True)
         for line in r.iter_lines():
             if not line:
@@ -160,3 +214,40 @@ class LocalLLM:
             delta = json.loads(payload)["choices"][0]["delta"].get("content")
             if delta:
                 yield delta
+
+    def stream_answer(self, question: str, context: str | None = None) -> Iterator[str]:
+        """Genera la respuesta para `question` (ya debería venir autónoma/reescrita si corresponde)
+        + `context` de este turno. Stateless: no lee ni actualiza self.history -- llamar a
+        record_turn() aparte con lo que corresponda guardar."""
+        user = f"CONTEXTO:\n{context}\n\nPREGUNTA: {question}" if context else question
+        messages = [
+            {"role": "system", "content": self.cfg.system_prompt},
+            {"role": "user", "content": user},
+        ]
+        yield from self._stream_from_messages(messages)
+
+    def stream_answer_multi(self, subquestions: list[tuple[str, str | None]]) -> Iterator[str]:
+        """Una sola llamada al LLM de respuesta cubriendo varias sub-preguntas YA resueltas (con
+        CONTEXTO válido, o chitchat sin CONTEXTO) -- ver voice/pipeline.py: Assistant.answer(). Las
+        sub-preguntas que abstuvieron o dieron ambiguo NO llegan acá: se resuelven aparte con una
+        nota fija NO generada (voice/guardrails.py: abstain_partial_reply/clarify_reply) que se
+        concatena a lo que este método devuelve.
+
+        Con una sola sub-pregunta (el caso de siempre, sin descomposición) es exactamente
+        stream_answer -- no hay cambio de comportamiento ni de prompt para preguntas simples."""
+        if len(subquestions) == 1:
+            q, ctx = subquestions[0]
+            yield from self.stream_answer(q, ctx)
+            return
+
+        parts = []
+        for i, (q, ctx) in enumerate(subquestions, 1):
+            block = f"PARTE {i}\nPREGUNTA: {q}"
+            if ctx:
+                block += f"\nCONTEXTO:\n{ctx}"
+            parts.append(block)
+        messages = [
+            {"role": "system", "content": self.cfg.system_prompt + rewrite.MULTI_PART_SUFFIX},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        yield from self._stream_from_messages(messages)

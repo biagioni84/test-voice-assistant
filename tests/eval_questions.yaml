@@ -246,15 +246,17 @@
     - "La oficina no abre los domingos, ¿verdad?"
 
 - id: pregunta_compuesta
+  compound: true
   note: >
     dos preguntas en un mismo turno, sobre el mismo documento. Con el reranker (23/09, ver README):
     REGRESIÓN nueva pero reveladora -- el chunk correcto (tiene las dos partes de la respuesta)
     puntúa -0.66 con el reranker para esta frase imperativa/compuesta ("Decime X y también Y"), por
     debajo de min_score=0.0, así que ahora abstiene en vez de responder (antes, por casualidad del
-    coseno, respondía bien). No es un problema de umbral: es exactamente el caso que motiva separar
+    coseno, respondía bien). No es un problema de umbral: es exactamente el caso que motivó separar
     "pregunta compuesta" (dos datos, un tema) de "pregunta ambigua" (un dato, dos fuentes en
-    conflicto) descomponiendo en sub-preguntas antes del retrieval, en vez de mandar la pregunta
-    compuesta tal cual.
+    conflicto) descomponiendo en sub-preguntas antes del retrieval (punto 4, ver README) en vez de
+    mandar la pregunta compuesta tal cual. FIJADO con la descomposición: cada mitad se retrieval-ea
+    por separado, así que el reranker nunca ve la frase compuesta completa.
   expect: "debe responder ambas partes: horario de lunes a viernes Y de sábados"
   turns:
     - "Decime el horario de lunes a viernes y también el de los sábados."
@@ -302,3 +304,53 @@
   turns:
     - "¿A qué hora abre la oficina el domingo?"
     - "Uy perdón, quise decir el sábado."
+
+# ============================================================================
+# VALIDACIÓN -- descomposición de preguntas compuestas (punto 4). Formulaciones que NO se parecen
+# a los ejemplos few-shot de voice/rewrite.py:_DECOMPOSE_EXAMPLES (a propósito: agregar un caso
+# calcado de un few-shot no prueba generalización, sería "hacer trampa" -- mismo criterio que el
+# resto de la sección validation de arriba).
+# ============================================================================
+
+- id: validation_compuesta_primer_turno
+  compound: true
+  split: validation
+  note: >
+    compuesta desde el PRIMER turno de la charla, sin historial -- el caso que corrige el diseño
+    original (que gateaba toda la descomposición detrás de "if not self.history").
+  expect: "debe responder las dos partes: horario de lunes a viernes Y cómo restablecer la contraseña"
+  turns:
+    - "¿Cuál es el horario de la oficina de lunes a viernes y cómo puedo restablecer la contraseña del correo?"
+
+- id: validation_compuesta_followup
+  compound: true
+  split: validation
+  note: >
+    compuesta como turno de seguimiento, después de un turno previo sobre un tema distinto -- prueba
+    que la descomposición no se confunda con el historial de un tema que no tiene nada que ver.
+  expect: "el último turno debe responder cuándo se pagan los sueldos Y cuántos días de vacaciones, sin mezclar el horario de sábados del turno anterior"
+  turns:
+    - "¿A qué hora abre la oficina los sábados?"
+    - "Y aparte, ¿cuándo se pagan los sueldos y cuántos días de vacaciones tengo?"
+
+- id: validation_compuesta_parte_fuera_de_dominio
+  compound: true
+  split: validation
+  note: >
+    una parte tiene respuesta en los documentos, la otra no tiene nada que ver -- la parte
+    resuelta debe responderse normalmente y la otra debe abstener con una nota fija, sin que una
+    contamine a la otra (ni alucinar la segunda ni abstener de más en la primera).
+  expect: "debe dar el horario de sábados Y decir que no tiene información sobre la capital de Francia (nota fija, sin alucinar)"
+  turns:
+    - "¿Cuál es el horario de la oficina los sábados y cuál es la capital de Francia?"
+
+- id: validation_compuesta_imperativa
+  compound: true
+  split: validation
+  note: >
+    fraseo imperativo distinto al del few-shot ("Decime X y también Y") -- usa "Contame"/"de paso
+    decime" en vez de esas palabras exactas, para probar que la normalización a interrogativas
+    generaliza y no fue memorizada.
+  expect: "debe responder el horario del sábado Y qué hacer si la computadora no enciende"
+  turns:
+    - "Contame el horario del sábado y de paso decime qué hago si la computadora no enciende."

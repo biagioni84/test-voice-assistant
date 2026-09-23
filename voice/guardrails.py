@@ -50,6 +50,15 @@ def abstain_reply(question: str, has_history: bool = False) -> str:
     return "No tengo información sobre eso."
 
 
+def abstain_partial_reply(subquestion: str) -> str:
+    """Nota fija (NO generada) para UNA sub-pregunta sin CONTEXTO dentro de una pregunta compuesta
+    (ver voice/llm.py: rewrite_query en modo descomposición). A diferencia de abstain_reply (que
+    reemplaza TODA la respuesta), esto se concatena junto a la respuesta generada para las
+    sub-preguntas que sí se resolvieron -- por eso nombra la sub-pregunta puntual, para que quede
+    claro a cuál de las partes se refiere."""
+    return f"No tengo información para responder esto: {subquestion}"
+
+
 def ambiguous_docs(hits: list, threshold: float) -> tuple[str, str] | None:
     """Si los dos documentos DISTINTOS con mejor score (no necesariamente los hits en posición 1 y
     2 -- si el top-2 son del mismo doc, se ignoran entre sí y se compara contra el mejor de otro

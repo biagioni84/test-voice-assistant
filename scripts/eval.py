@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import voice  # noqa: F401,E402  (importa llama_cpp primero)
+from voice import rewrite  # noqa: E402
 from voice.config import load_config  # noqa: E402
 from voice.pipeline import Assistant  # noqa: E402
 
@@ -52,7 +53,7 @@ def run_rewrite_case(bot: Assistant, case: dict) -> list[str]:
 
     import time
     t0 = time.monotonic()
-    out, was_rewritten = bot.llm.rewrite_query(case["question"])
+    subqs, was_rewritten = bot.llm.rewrite_query(case["question"])
     dt_ms = (time.monotonic() - t0) * 1000
     rewrite_latencies_ms.append(dt_ms)
 
@@ -66,7 +67,11 @@ def run_rewrite_case(bot: Assistant, case: dict) -> list[str]:
         lines.append(f"- 🗣 {u}")
         lines.append(f"  - 🤖 {a}")
     lines.append(f"- 🗣 **{case['question']}**")
-    lines.append(f"  - ➜ reescrita: **{out}** (se_reescribió={was_rewritten}, {dt_ms:.0f}ms)")
+    if len(subqs) > 1:
+        sub_txt = " | ".join(subqs)
+        lines.append(f"  - ➜ descompuesta en {len(subqs)}: **{sub_txt}** (se_reescribió={was_rewritten}, {dt_ms:.0f}ms)")
+    else:
+        lines.append(f"  - ➜ reescrita: **{subqs[0]}** (se_reescribió={was_rewritten}, {dt_ms:.0f}ms)")
     lines.append("")
     return lines
 
@@ -86,7 +91,9 @@ def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], sh
         if turn.t_rewrite:
             rewrite_latencies_ms.append(turn.t_rewrite * 1000)
         lines.append(f"- 🗣 **{q}**")
-        if turn.was_rewritten:
+        if turn.was_rewritten and len(turn.subquestions) > 1:
+            lines.append(f"  - ➜ descompuesta en {len(turn.subquestions)}: {turn.subquestions!r}")
+        elif turn.was_rewritten:
             lines.append(f"  - ➜ reescrita: {turn.retrieval_query!r}")
         lines.append(f"  - 🤖 {turn.answer}")
         if not turn.context_hits:
@@ -141,6 +148,33 @@ def main() -> None:
             else:
                 for label, turns in case_variants(case):
                     body += run_case(bot, case, label, turns, args.show_chunk_text)
+
+    # tasa de falsos positivos del pre-filtro barato (voice/rewrite.py: looks_compound) sobre
+    # preguntas que NO son compuestas -- casos marcados "compound: true" se excluyen (ahí SÍ debe
+    # disparar, es lo esperado). Un falso positivo acá solo cuesta latencia (ver looks_compound),
+    # pero igual conviene medirlo para saber si sale caro en la práctica.
+    total_q = fired_q = 0
+    for case in cases:
+        if case.get("compound"):
+            continue
+        if case.get("type") == "rewrite":
+            texts = [case["question"]]
+        elif "variants" in case:
+            texts = [q for v in case["variants"] for q in v]
+        else:
+            texts = list(case["turns"])
+        for text in texts:
+            total_q += 1
+            if rewrite.looks_compound(text):
+                fired_q += 1
+    if total_q:
+        body.append(
+            f"**Falsos positivos del pre-filtro de preguntas compuestas** (sobre preguntas NO "
+            f"marcadas `compound: true`): {fired_q}/{total_q} ({fired_q / total_q:.0%}) dispararon "
+            f"el pre-filtro sin ser compuestas -- cada una paga solo la latencia extra de una "
+            f"llamada de reescritura en modo descomposición, que debería devolver 1 sola sub-pregunta."
+        )
+        body.append("")
 
     if rewrite_latencies_ms:
         def pct(xs, p):

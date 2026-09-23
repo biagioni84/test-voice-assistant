@@ -102,12 +102,13 @@ class Retriever:
             cache.parent.mkdir(exist_ok=True)
             np.save(cache, self._matrix)
 
-    def retrieve(self, query: str) -> list[Hit]:
+    def score_candidates(self, query: str) -> list[Hit]:
         """Primer filtro por coseno (barato, sobre todos los chunks) para traer
         `reranker_candidates` candidatos; si hay reranker, los reordena con el cross-encoder (juicio
-        de relevancia semántica más fino que el coseno, ver README) y ESE score es el que se filtra
-        contra `min_score` y el que usan el gate de ambigüedad y la abstención. Sin reranker, se
-        queda con el coseno tal como antes."""
+        de relevancia semántica más fino que el coseno, ver README). A diferencia de retrieve(), NO
+        filtra por `min_score` ni corta a `top_k` -- devuelve TODOS los candidatos, ordenados por
+        score final descendente. Sirve para evaluar distintos umbrales sin volver a llamar al
+        modelo (ver scripts/calibrate.py); retrieve() es un filtro sobre esto mismo."""
         if not self.chunks:
             return []
         dense = self._matrix @ self._embed([query])[0]
@@ -117,18 +118,38 @@ class Retriever:
         if self._reranker:
             texts = [self.chunks[i][1] for i in cand_idx]
             rerank_scores = list(self._reranker.rerank(query, texts))
-            order = sorted(range(len(cand_idx)), key=lambda j: -rerank_scores[j])[: self.cfg.top_k]
+            order = sorted(range(len(cand_idx)), key=lambda j: -rerank_scores[j])
             return [
                 Hit(float(rerank_scores[j]), *self.chunks[cand_idx[j]], dense_score=float(dense[cand_idx[j]]))
                 for j in order
-                if rerank_scores[j] >= self.cfg.min_score
             ]
 
+        order = sorted(range(len(cand_idx)), key=lambda j: -dense[cand_idx[j]])
         return [
-            Hit(float(dense[i]), *self.chunks[i], dense_score=float(dense[i]))
-            for i in cand_idx
-            if dense[i] >= self.cfg.min_score
+            Hit(float(dense[cand_idx[j]]), *self.chunks[cand_idx[j]], dense_score=float(dense[cand_idx[j]]))
+            for j in order
         ]
+
+    def dense_top_n(self, query: str, n: int) -> list[Hit]:
+        """Top-n SOLO por coseno, SIN reranker -- vista de diagnóstico para medir recall@n de la
+        etapa densa antes de que el reranker reordene (ver scripts/calibrate.py). No es lo que usa
+        retrieve()/score_candidates() en producción (que traen reranker_candidates para el
+        reranker); acá `n` puede ser cualquier valor, típicamente más chico que reranker_candidates,
+        para chequear si el primer filtro ya pierde el chunk correcto antes de que el reranker
+        tenga la chance de reordenarlo."""
+        if not self.chunks:
+            return []
+        dense = self._matrix @ self._embed([query])[0]
+        idx = np.argsort(-dense)[:n]
+        return [Hit(float(dense[i]), *self.chunks[i], dense_score=float(dense[i])) for i in idx]
+
+    def retrieve(self, query: str) -> list[Hit]:
+        """score_candidates() filtrado por `min_score` y cortado a `top_k` -- lo que usa el
+        pipeline en producción. (Equivalente a "top_k primero, filtrar después": como los
+        candidatos ya vienen ordenados descendente, da exactamente el mismo resultado que filtrar
+        primero y cortar después.)"""
+        hits = [h for h in self.score_candidates(query) if h.score >= self.cfg.min_score]
+        return hits[: self.cfg.top_k]
 
     @staticmethod
     def format_context(hits: list[Hit]) -> str:

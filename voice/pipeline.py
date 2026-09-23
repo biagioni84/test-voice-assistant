@@ -8,9 +8,10 @@ import numpy as np
 
 from .audio import Mic, Speaker
 from .config import Config
-from .guardrails import abstain_reply, ambiguous_docs, clarify_reply, is_chitchat
+from .guardrails import abstain_partial_reply, abstain_reply, ambiguous_docs, clarify_reply, is_chitchat
 from .llm import LocalLLM
 from .rag import Retriever
+from .rewrite import strip_part_labels
 from .stt import Transcriber
 from .tts import PiperTTS, StreamingSpeaker, iter_sentences
 from .vad import UtteranceRecorder
@@ -23,7 +24,8 @@ POST_WAKE_SKIP_MS = 200  # descarta la cola de la propia palabra de activación 
 class Turn:
     """Resultado y métricas (segundos) de un turno de conversación."""
     question: str = ""             # lo que dijo/escribió el usuario, tal cual
-    retrieval_query: str = ""      # pregunta usada para RAG (== question si no hubo reescritura)
+    retrieval_query: str = ""      # pregunta(s) usada(s) para RAG, para logging (ver subquestions)
+    subquestions: list = field(default_factory=list)  # 1 elemento salvo que se haya descompuesto
     was_rewritten: bool = False
     answer: str = ""
     context_hits: list = field(default_factory=list)
@@ -94,29 +96,50 @@ class Assistant:
         has_history = bool(self.llm.history)
 
         t = time.monotonic()
-        retrieval_query, was_rewritten = self.llm.rewrite_query(question)
+        subquestions, was_rewritten = self.llm.rewrite_query(question)
         turn.t_rewrite = time.monotonic() - t
-        turn.retrieval_query = retrieval_query
+        turn.subquestions = subquestions
+        turn.retrieval_query = subquestions[0] if len(subquestions) == 1 else " / ".join(subquestions)
         turn.was_rewritten = was_rewritten
-        if was_rewritten:
-            print(f"   (reescrita: {retrieval_query!r})", flush=True)
+        if was_rewritten and len(subquestions) > 1:
+            print(f"   (descompuesta en {len(subquestions)} sub-preguntas: {subquestions!r})", flush=True)
+        elif was_rewritten:
+            print(f"   (reescrita: {subquestions[0]!r})", flush=True)
 
-        t = time.monotonic()
-        hits = self.rag.retrieve(retrieval_query) if self.rag else []
-        turn.t_rag = time.monotonic() - t
-        turn.context_hits = hits
+        # retrieval + gate de abstención/ambigüedad, independiente por sub-pregunta (ver punto 4:
+        # con una sola sub-pregunta -- el caso de siempre -- esto es exactamente lo de antes).
+        resolved: list[tuple[str, str | None]] = []  # (sub-pregunta, contexto o None) -> al LLM
+        unresolved_notes: list[str] = []               # notas FIJAS (no generadas) para el resto
+        all_hits = []
+        for subq in subquestions:
+            t = time.monotonic()
+            hits = self.rag.retrieve(subq) if self.rag else []
+            turn.t_rag += time.monotonic() - t
+            all_hits += hits
 
-        if self.rag and not hits and not is_chitchat(retrieval_query):
-            answer_text = abstain_reply(retrieval_query, has_history)
+            if self.rag and not hits and not is_chitchat(subq):
+                if len(subquestions) > 1:
+                    unresolved_notes.append(abstain_partial_reply(subq))
+                else:
+                    unresolved_notes.append(abstain_reply(subq, has_history))
+                continue
+
+            if self.rag and hits:
+                ambiguous = ambiguous_docs(hits, self.cfg.rag.ambiguity_threshold)
+                if ambiguous:
+                    unresolved_notes.append(clarify_reply(*ambiguous, self.cfg.rag.doc_topics))
+                    continue
+
+            context = Retriever.format_context(hits) if hits else None
+            resolved.append((subq, context))
+
+        turn.context_hits = all_hits
+
+        if not resolved:
+            # ninguna sub-pregunta se resolvió: la respuesta son las notas fijas nada más, sin
+            # llamar al LLM de respuesta (mismo camino de siempre para el caso de 1 sola pregunta)
+            answer_text = " ".join(unresolved_notes)
             return self._fixed_reply(question, answer_text, turn, t0)
-
-        if self.rag and hits:
-            ambiguous = ambiguous_docs(hits, self.cfg.rag.ambiguity_threshold)
-            if ambiguous:
-                answer_text = clarify_reply(*ambiguous, self.cfg.rag.doc_topics)
-                return self._fixed_reply(question, answer_text, turn, t0)
-
-        context = Retriever.format_context(hits) if hits else None
 
         out = StreamingSpeaker(self.tts, self.speaker)
         t_llm = time.monotonic()
@@ -125,23 +148,41 @@ class Assistant:
 
         def counted():
             nonlocal first
-            # el LLM de respuesta recibe la pregunta YA reescrita/autónoma, sin el historial de la
-            # charla (ver voice/llm.py: stream_answer es stateless a propósito)
-            for tok in self.llm.stream_answer(retrieval_query, context):
+            # el LLM de respuesta recibe las sub-preguntas YA reescritas/autónomas, sin el
+            # historial de la charla (ver voice/llm.py: stream_answer(_multi) es stateless a propósito)
+            for tok in self.llm.stream_answer_multi(resolved):
                 if first is None:
                     first = time.monotonic()
                 tokens.append(tok)
                 yield tok
 
+        # en modo multi-parte (>1 sub-pregunta resuelta), el LLM etiqueta cada línea "Parte N: "
+        # como andamiaje para no ignorar ninguna parte (ver rewrite.MULTI_PART_SUFFIX) -- eso no es
+        # para el usuario, se saca acá antes de hablar/mostrar/guardar la respuesta.
+        multi_part = len(resolved) > 1
+        spoken: list[str] = []
         print("🤖 ", end="", flush=True)
         for sentence in iter_sentences(counted()):
+            if multi_part:
+                sentence = strip_part_labels(sentence)
+                if not sentence:
+                    continue
             print(sentence, end=" ", flush=True)
             out.say(sentence)
-        print(flush=True)
+            spoken.append(sentence)
         turn.t_llm_total = time.monotonic() - t_llm
         turn.t_llm_first_token = (first or time.monotonic()) - t_llm
         turn.n_tokens = len(tokens)
-        turn.answer = "".join(tokens).strip()
+        generated = " ".join(spoken).strip() if multi_part else "".join(tokens).strip()
+
+        # las sub-preguntas que abstuvieron/dieron ambiguo se agregan al final, como notas fijas
+        # (no generadas) -- no pasaron por el LLM en absoluto (ver punto 4 del README)
+        for note in unresolved_notes:
+            print(note, end=" ", flush=True)
+            out.say(note)
+        print(flush=True)
+        turn.answer = " ".join([generated, *unresolved_notes]).strip()
+
         out.finish()
         # se guarda la pregunta ORIGINAL (no la reescrita): así la próxima reescritura ve la charla
         # tal como pasó de verdad, no una versión ya "limpiada" de sí misma.

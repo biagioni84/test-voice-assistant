@@ -1,0 +1,74 @@
+# Set etiquetado para scripts/calibrate.py -- NO es para verificar comportamiento (eso es
+# tests/eval_questions.yaml), es para ELEGIR los valores de rag.min_score y
+# rag.ambiguity_threshold de forma principista en vez de a mano contra casos puntuales.
+#
+# Atado a los documentos de docs/ (genéricos, de prueba) -- cuando lleguen los documentos reales,
+# este archivo se reescribe entero con preguntas sobre ESOS documentos, y se corre
+# scripts/calibrate.py de nuevo. No tiene sentido calibrar contra los docs viejos.
+#
+# label:
+#   in_domain:     hay un documento real que responde esto -- NO debería abstener
+#   out_of_domain: no tiene nada que ver con ningún documento -- SÍ debería abstener
+#   no_answer:     el tema está en los documentos pero el dato puntual no está -- SÍ debería abstener
+#   ambiguous:     la pregunta calza genuinamente con 2+ documentos distintos a la vez --
+#                  debería activar el gate de ambigüedad (no alucinar ni abstener sin más)
+#
+# expected_doc / expected_docs son informativos (para leer el reporte), el script no los usa para
+# calcular los umbrales -- eso depende solo de los scores que devuelve el retriever.
+
+- question: "¿A qué hora abre la oficina los sábados?"
+  label: in_domain
+  expected_doc: oficina.md
+
+- question: "¿A qué hora abre la oficina de lunes a viernes?"
+  label: in_domain
+  expected_doc: oficina.md
+
+- question: "¿Cómo puedo restablecer la contraseña del correo?"
+  label: in_domain
+  expected_doc: soporte_tecnico.md
+
+- question: "¿Qué hago si la computadora no enciende?"
+  label: in_domain
+  expected_doc: soporte_tecnico.md
+
+- question: "¿Cuántos días de vacaciones tengo por año?"
+  label: in_domain
+  expected_doc: recursos_humanos.md
+
+- question: "¿Cuándo se pagan los sueldos?"
+  label: in_domain
+  expected_doc: recursos_humanos.md
+
+- question: "¿Cuál es la capital de Francia?"
+  label: out_of_domain
+
+- question: "¿Qué hora es en Tokio ahora mismo?"
+  label: out_of_domain
+
+- question: "Contame un chiste."
+  label: out_of_domain
+
+- question: "¿Cómo se hace una tortilla de papas?"
+  label: out_of_domain
+
+- question: "¿Cuántos empleados tiene la empresa?"
+  label: no_answer
+
+- question: "¿Quién es el dueño de la empresa?"
+  label: no_answer
+
+- question: "¿Cuál es el sueldo promedio en la empresa?"
+  label: no_answer
+
+- question: "¿Puedo trabajar desde casa los sábados?"
+  label: ambiguous
+  expected_docs: [oficina.md, recursos_humanos.md]
+
+- question: "¿El sábado puedo hacer home office?"
+  label: ambiguous
+  expected_docs: [oficina.md, recursos_humanos.md]
+
+- question: "¿Está permitido trabajar remoto los sábados?"
+  label: ambiguous
+  expected_docs: [oficina.md, recursos_humanos.md]

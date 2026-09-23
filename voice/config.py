@@ -113,7 +113,25 @@ def load_config(path: str | Path | None = None) -> Config:
     for f in fields(Config):
         section_cls = f.type if not isinstance(f.type, str) else globals()[f.type]
         parts[f.name] = section_cls(**raw.get(f.name, {}))
-    return Config(**parts)
+    cfg = Config(**parts)
+    _apply_calibration(cfg)
+    return cfg
+
+
+def _apply_calibration(cfg: Config) -> None:
+    """Superpone calibration.toml (generado por scripts/calibrate.py, ver tests/calibration_questions.yaml)
+    sobre los umbrales de RagCfg, si ese archivo existe. config.toml sigue siendo la fuente de los
+    valores default/documentados (para un checkout nuevo sin haber corrido la calibración todavía);
+    calibration.toml, si está, los pisa. Así recalibrar para documentos reales es correr
+    `python scripts/calibrate.py` de nuevo, sin tocar config.toml a mano -- ver README, sección
+    "parámetros calibrados vs. arquitectura estable"."""
+    path = ROOT / "calibration.toml"
+    if not path.exists():
+        return
+    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    for key, value in raw.get("rag", {}).items():
+        if hasattr(cfg.rag, key):
+            setattr(cfg.rag, key, value)
 
 
 def resolve(p: str | Path) -> Path:

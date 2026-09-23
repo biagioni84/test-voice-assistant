@@ -43,17 +43,22 @@ reranker_enabled = true
 reranker_model = "jinaai/jina-reranker-v2-base-multilingual"
 reranker_candidates = 5
 
-# Calibrado con tests/eval_questions.yaml (ver README): las preguntas con respuesta real puntúan
-# +0.41 a +1.52; el near-miss que antes se colaba con coseno (0.36, apenas sobre el viejo umbral de
-# 0.35) puntúa -3.22 con el reranker -- separación mucho más limpia que con coseno.
+# PROVISORIO, atado a los documentos genéricos de docs/ -- ver README "parámetros calibrados vs.
+# arquitectura estable". Estos son solo el FALLBACK: si existe calibration.toml (generado por
+# `python scripts/calibrate.py` contra tests/calibration_questions.yaml) lo pisa (ver
+# voice/config.py: _apply_calibration). No los edites a mano pensando que van a tener efecto una
+# vez que calibration.toml exista -- volvé a correr calibrate.py en cambio. Valores acá: el default
+# documentado para un checkout nuevo sin calibración corrida todavía.
 min_score = 0.0             # bajo este score del reranker no se inyecta contexto
 ambiguity_threshold = 0.5   # si los 2 docs con mejor score (ambos ya sobre min_score) están a menos
-                            # que esto, se pide aclaración en vez de generar. Con el reranker, los 3
-                            # casos de retrieval_ambiguo_dos_docs ya NO llegan acá con 2 candidatos
-                            # sobre min_score a la vez -- se resuelven antes, por abstención (ningún
-                            # doc puntúa positivo) o por un solo candidato claramente mejor. Este
-                            # umbral queda para el caso genuino de 2 candidatos fuertes y parejos,
-                            # que no apareció en los datos disponibles; revisar si aparece en uso real.
+                            # que esto, se pide aclaración en vez de generar. Con el reranker, rara
+                            # vez quedan 2 candidatos parejos Y ambos sobre min_score a la vez -- se
+                            # resuelven antes, por abstención (ningún doc puntúa positivo) o por un
+                            # solo candidato claramente mejor (ver README: se probó forzar min_score
+                            # más bajo para que el gate de ambigüedad tuviera más candidatos, y trajo
+                            # un problema peor -- falsos positivos de ambigüedad en preguntas de un
+                            # solo tema). Este umbral queda para el caso genuino de 2 candidatos
+                            # fuertes y parejos; revisar si aparece más seguido con documentos reales.
 
 [rag.doc_topics]            # nombres de tema para el mensaje de aclaración del gate de ambigüedad
 "oficina.md" = "horarios y logística de oficina"
