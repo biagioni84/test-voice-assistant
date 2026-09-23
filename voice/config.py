@@ -50,10 +50,13 @@ class RagCfg:
     docs_dir: str = "docs"
     embed_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     top_k: int = 3
-    min_score: float = 0.30
+    min_score: float = 0.30    # en escala del reranker si reranker_enabled, si no coseno (0-1)
     chunk_chars: int = 500
-    ambiguity_threshold: float = 0.08  # ver voice/guardrails.py: ambiguous_docs()
+    ambiguity_threshold: float = 0.08  # ver voice/guardrails.py: ambiguous_docs() -- misma escala
     doc_topics: dict = field(default_factory=dict)  # "archivo.md" -> "nombre de tema" para el gate
+    reranker_enabled: bool = True
+    reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"
+    reranker_candidates: int = 10  # cuántos candidatos trae el filtro de coseno antes de rerankear
 
 
 @dataclass

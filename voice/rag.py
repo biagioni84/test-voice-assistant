@@ -1,4 +1,5 @@
-"""RAG mínimo: chunking por párrafos + embeddings multilingües (fastembed/ONNX) + coseno en numpy.
+"""RAG: chunking por párrafos + embeddings multilingües (fastembed/ONNX) + coseno para el primer
+filtro, más un reranker cross-encoder sobre los candidatos (ver Retriever.retrieve).
 
 Para un POC con pocos documentos esto alcanza y evita una vector DB. Si el corpus crece a decenas de
 miles de chunks, reemplazar `_matrix` por FAISS/sqlite-vec manteniendo la misma interfaz `retrieve()`.
@@ -16,9 +17,11 @@ from .config import ROOT, RagCfg, resolve
 
 @dataclass
 class Hit:
-    score: float
+    score: float           # score final que usan el gate de ambigüedad y la abstención: el del
+                            # reranker si está activo (logit crudo, no 0-1), si no el coseno
     source: str
     text: str
+    dense_score: float = 0.0  # coseno original, para debug (--show-chunk-text)
 
 
 def _extract_title(text: str) -> tuple[str, str]:
@@ -64,6 +67,14 @@ class Retriever:
         self._matrix = np.zeros((0, 1), dtype=np.float32)
         self._build()
 
+        self._reranker = None
+        if cfg.reranker_enabled:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+            self._reranker = TextCrossEncoder(
+                cfg.reranker_model, cache_dir=str(ROOT / "models" / "reranker")
+            )
+
     def _embed(self, texts: list[str]) -> np.ndarray:
         v = np.array(list(self._emb.embed(texts)), dtype=np.float32)
         return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-9)
@@ -92,12 +103,31 @@ class Retriever:
             np.save(cache, self._matrix)
 
     def retrieve(self, query: str) -> list[Hit]:
+        """Primer filtro por coseno (barato, sobre todos los chunks) para traer
+        `reranker_candidates` candidatos; si hay reranker, los reordena con el cross-encoder (juicio
+        de relevancia semántica más fino que el coseno, ver README) y ESE score es el que se filtra
+        contra `min_score` y el que usan el gate de ambigüedad y la abstención. Sin reranker, se
+        queda con el coseno tal como antes."""
         if not self.chunks:
             return []
-        scores = self._matrix @ self._embed([query])[0]
-        top = np.argsort(-scores)[: self.cfg.top_k]
+        dense = self._matrix @ self._embed([query])[0]
+        n = self.cfg.reranker_candidates if self._reranker else self.cfg.top_k
+        cand_idx = np.argsort(-dense)[:n]
+
+        if self._reranker:
+            texts = [self.chunks[i][1] for i in cand_idx]
+            rerank_scores = list(self._reranker.rerank(query, texts))
+            order = sorted(range(len(cand_idx)), key=lambda j: -rerank_scores[j])[: self.cfg.top_k]
+            return [
+                Hit(float(rerank_scores[j]), *self.chunks[cand_idx[j]], dense_score=float(dense[cand_idx[j]]))
+                for j in order
+                if rerank_scores[j] >= self.cfg.min_score
+            ]
+
         return [
-            Hit(float(scores[i]), *self.chunks[i]) for i in top if scores[i] >= self.cfg.min_score
+            Hit(float(dense[i]), *self.chunks[i], dense_score=float(dense[i]))
+            for i in cand_idx
+            if dense[i] >= self.cfg.min_score
         ]
 
     @staticmethod

@@ -135,11 +135,10 @@
   note: >
     regresión del bug de "expandir con el tema equivocado" — un comentario sin tema en medio de la
     charla no debe hacer que se pierda el contexto real para el siguiente follow-up corto. La
-    reescritura de consulta lo resuelve bien: el último turno recupera oficina.md@0.81 (dominante,
-    correcto). BUG NUEVO (23/09, no relacionado con la reescritura): el LLM de respuesta a veces
-    ignora ese chunk dominante (0.81) y responde con el otro chunk del mismo doc (0.49, "salas de
-    reunión"), sin relación con la pregunta -- misma familia que retrieval_ambiguo_dos_docs (el LLM
-    no siempre usa el CONTEXTO más relevante que se le da), no algo que la reescritura pueda arreglar.
+    reescritura de consulta lo resuelve bien. Había un near-miss real acá (el turno del medio traía
+    soporte_tecnico.md con coseno 0.36, apenas sobre el viejo umbral 0.35) -- FIJADO (23/09) con el
+    reranker: ese mismo chunk puntúa -3.22 en la escala del reranker, muy por debajo de min_score=0.0.
+    Los 3 turnos pasan limpio ahora.
   expect: "el último turno debe volver a hablar del horario de sábados, no inventar 'oficina de soporte técnico'"
   turns:
     - "¿A qué hora abre la oficina los sábados?"
@@ -209,15 +208,14 @@
 
 - id: retrieval_ambiguo_dos_docs
   note: >
-    PARCIALMENTE MITIGADO (23/09): originalmente 3/3 fallaban alucinando (ver README). Se agregó un
-    gate determinista (voice/guardrails.py: ambiguous_docs) que pide aclaración en vez de generar
-    cuando los 2 docs con mejor score están a menos de rag.ambiguity_threshold=0.10 -- ahora 2/3
-    piden aclaración correctamente. La variante 3 (diff=0.21, oficina.md domina claramente) no es
-    ambigüedad real, es el modelo malinterpretando un solo chunk dominante -- el gate no puede ni
-    debería agarrar eso, es bug A puro. LÍMITE CONOCIDO del gate: pregunta_compuesta (otro caso,
-    sin relación con este) dispara el mismo gate por error con un score-gap idéntico (0.04) al de
-    una ambigüedad real -- el coseno de embeddings no alcanza para distinguir ambigüedad real de
-    vocabulario parecido por casualidad; haría falta un reranker de verdad.
+    MEJORADO CON RERANKER (23/09, ver README): originalmente 3/3 alucinaban mezclando 2 docs. Con el
+    reranker (jina-reranker-v2-base-multilingual) + min_score=0.0 recalibrado: variantes 1 y 2 ahora
+    ABSTIENEN honestamente (ningún doc puntúa positivo -- más seguro que forzar una aclaración). La
+    variante 3 recupera 1 solo doc correcto (ya no mezcla), pero el LLM lo malinterpreta (invierte
+    qué días son de presencia obligatoria) -- eso es "bug A" puro, no algo que retrieval pueda
+    arreglar. El gate de ambigüedad (ambiguous_docs) casi no llega a intervenir en estos 3 casos con
+    el reranker: al filtrar primero por min_score, rara vez quedan 2 candidatos parejos Y ambos
+    positivos a la vez -- se resuelven antes, por abstención o por un solo candidato claro.
   expect: "no debería inventar una política que mezcle las dos cosas"
   variants:
     - ["¿Puedo trabajar desde casa los sábados?"]
@@ -249,10 +247,14 @@
 
 - id: pregunta_compuesta
   note: >
-    dos preguntas en un mismo turno, sobre el mismo documento. FALSO POSITIVO CONOCIDO (23/09): tras
-    el chunking más fino + el gate de ambigüedad cross-doc, esto dispara el gate por error (score-gap
-    oficina.md vs recursos_humanos.md = 0.04, igual de chico que una ambigüedad real -- ver
-    retrieval_ambiguo_dos_docs). Antes (sin el gate) respondía bien las dos partes.
+    dos preguntas en un mismo turno, sobre el mismo documento. Con el reranker (23/09, ver README):
+    REGRESIÓN nueva pero reveladora -- el chunk correcto (tiene las dos partes de la respuesta)
+    puntúa -0.66 con el reranker para esta frase imperativa/compuesta ("Decime X y también Y"), por
+    debajo de min_score=0.0, así que ahora abstiene en vez de responder (antes, por casualidad del
+    coseno, respondía bien). No es un problema de umbral: es exactamente el caso que motiva separar
+    "pregunta compuesta" (dos datos, un tema) de "pregunta ambigua" (un dato, dos fuentes en
+    conflicto) descomponiendo en sub-preguntas antes del retrieval, en vez de mandar la pregunta
+    compuesta tal cual.
   expect: "debe responder ambas partes: horario de lunes a viernes Y de sábados"
   turns:
     - "Decime el horario de lunes a viernes y también el de los sábados."

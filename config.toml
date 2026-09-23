@@ -33,18 +33,27 @@ enabled = true
 docs_dir = "docs"
 embed_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 top_k = 2
-min_score = 0.35           # bajo este coseno no se inyecta contexto (0.30 dejaba pasar matches
-                            # débiles e irrelevantes, p.ej. soporte_tecnico.md a 0.33 para preguntas
-                            # que no tenían nada que ver; ver README)
 chunk_chars = 500           # tope para partir un párrafo gigante; NO se usa para combinar párrafos
                             # distintos entre sí (un chunk = un párrafo = un hecho, ver README)
-ambiguity_threshold = 0.10  # si los 2 docs con mejor score están a menos que esto, se pide
-                            # aclaración en vez de generar. LÍMITE CONOCIDO (ver README): el score de
-                            # coseno no distingue "la pregunta toca 2 temas de verdad" de "un chunk
-                            # sin relación tiene vocabulario parecido por casualidad" -- pregunta_compuesta
-                            # dispara el gate con un gap (0.04) idéntico al de un caso de ambigüedad
-                            # real. Ningún umbral separa limpiamente ambos casos con esta señal sola;
-                            # haría falta un reranker de verdad (no tenemos uno) para hacerlo bien.
+
+# Reranker cross-encoder (voice/rag.py): el coseno solo, trae los reranker_candidates mejores
+# candidatos; el reranker los reordena con un juicio de relevancia más fino, y ESE score (logit
+# crudo, no 0-1) es el que se compara contra min_score y ambiguity_threshold de acá abajo.
+reranker_enabled = true
+reranker_model = "jinaai/jina-reranker-v2-base-multilingual"
+reranker_candidates = 5
+
+# Calibrado con tests/eval_questions.yaml (ver README): las preguntas con respuesta real puntúan
+# +0.41 a +1.52; el near-miss que antes se colaba con coseno (0.36, apenas sobre el viejo umbral de
+# 0.35) puntúa -3.22 con el reranker -- separación mucho más limpia que con coseno.
+min_score = 0.0             # bajo este score del reranker no se inyecta contexto
+ambiguity_threshold = 0.5   # si los 2 docs con mejor score (ambos ya sobre min_score) están a menos
+                            # que esto, se pide aclaración en vez de generar. Con el reranker, los 3
+                            # casos de retrieval_ambiguo_dos_docs ya NO llegan acá con 2 candidatos
+                            # sobre min_score a la vez -- se resuelven antes, por abstención (ningún
+                            # doc puntúa positivo) o por un solo candidato claramente mejor. Este
+                            # umbral queda para el caso genuino de 2 candidatos fuertes y parejos,
+                            # que no apareció en los datos disponibles; revisar si aparece en uso real.
 
 [rag.doc_topics]            # nombres de tema para el mensaje de aclaración del gate de ambigüedad
 "oficina.md" = "horarios y logística de oficina"

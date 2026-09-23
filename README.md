@@ -440,10 +440,58 @@ relación tiene vocabulario parecido por casualidad".
   `min_score` no lo arregla sin romper matches legítimos de score igual de bajo (`oficina.md@0.37`
   en follow-ups cortos).
 
-En ambos casos la solución de verdad es la que el pedido original ya anticipaba: un **reranker**
-(cross-encoder u otro modelo que juzgue relevancia semántica en vez de similaridad de embeddings
-cruda) en vez de comparar directamente los scores de coseno. No está implementado -- el gate actual
-opera sobre los scores de retrieval tal cual, sin una etapa de reranking real.
+En ambos casos la solución de verdad era la que el pedido original ya anticipaba: un **reranker**.
+Implementado en la siguiente ronda, ver abajo.
+
+## Reranker cross-encoder
+
+**Modelo**: `jinaai/jina-reranker-v2-base-multilingual` vía `fastembed.rerank.cross_encoder.TextCrossEncoder`
+(mismo paquete que ya usábamos para los embeddings densos, sin sumar `sentence-transformers`/`torch`).
+No es `bge-reranker-v2-m3` -- ese no está en el catálogo de fastembed; este es el cross-encoder
+multilingüe disponible más cercano (1.1GB, ONNX). **No hay retrieval híbrido** (denso+BM25) en este
+proyecto todavía, solo denso -- el reranker reordena candidatos del *mismo* retrieval por coseno de
+siempre, no de un híbrido. Si vale la pena sumar BM25 es una decisión aparte.
+
+**Dónde corre**: en CPU. Con Whisper + los 2 slots de llama-server ya usando ~3.6GB de los 4GB de
+VRAM, no entra (probado: solo quedan ~400-500MB libres). Igual que fastembed para los embeddings
+densos, mismo patrón.
+
+**Cómo se integra** (`voice/rag.py: Retriever.retrieve()`): el coseno de siempre trae los
+`reranker_candidates` mejores candidatos (antes esto ERA el resultado final); el reranker los
+reordena con un juicio de relevancia más fino, y ESE score (logit crudo del cross-encoder, no 0-1)
+es el que se compara contra `min_score` y alimenta el gate de ambigüedad. `Hit` ahora guarda también
+`dense_score` (el coseno original) para debug con `--show-chunk-text`.
+
+**Latencia medida**: ~55-60ms por candidato reranqueado (lineal). Con `reranker_candidates=10`
+(default inicial): ~600-870ms por retrieval -- una adición real y no trivial al "fin de voz → 1er
+audio" de *cada* pregunta, no solo las que reescriben. Bajado a `reranker_candidates=5` (nuestro
+corpus tiene 14 chunks en total, 5 candidatos ya cubre bien): ~270-340ms por retrieval, sin ninguna
+regresión en los casos de prueba. Medido en `bench.py` con el pipeline completo: VRAM 3.6GB (entra
+con margen), "fin de voz → 1er audio" pasó de ~1.40s a ~1.64s -- el reranker es ahora el segundo
+costo más grande del pipeline después del LLM.
+
+**Recalibración de umbrales** (antes en escala de coseno 0-1, ahora en escala del reranker: logit
+crudo, puede ser negativo): medido contra los casos de `tests/eval_questions.yaml` --
+
+| Caso | Score reranker | Antes (coseno) |
+|---|---|---|
+| Preguntas con respuesta real y clara (3 casos control) | **+0.41 a +1.52** | 0.57 a 0.81 |
+| `pregunta_sin_contexto` (control, sin doc relacionado) | -1.02 | 0.27 |
+| **Near-miss conocido** (`soporte_tecnico.md` para "¿por qué demoras?") | **-3.22** | 0.36 (¡apenas sobre el viejo umbral de 0.35!) |
+
+La separación es mucho más limpia que con coseno -- con `min_score=0.0`, todo lo bueno queda arriba y
+todo lo malo (incluido el near-miss que antes se colaba) queda abajo, sin zona gris. `ambiguity_threshold`
+subió a 0.5 (en esta escala, un gap chico entre dos candidatos que *ya* pasaron `min_score` -- no
+apareció ningún caso así en los datos disponibles, revisar si aparece en uso real).
+
+**Resultado, antes → después:**
+
+| Caso | Antes (coseno + gate) | Después (reranker) |
+|---|---|---|
+| `comentario_sin_tema_no_corta_continuidad` (near-miss) | ✗ alucinaba citando soporte_tecnico.md | ✓ **arreglado del todo** -- sin contexto, respuesta correcta |
+| `retrieval_ambiguo_dos_docs` variantes 1 y 2 | pedían aclaración (gate viejo, con falsos positivos en otros casos) | ✓ **abstienen** ("No tengo información sobre eso") -- ningún doc puntúa positivo, más honesto que forzar una aclaración |
+| `retrieval_ambiguo_dos_docs` variante 3 | alucinaba mezclando 2 docs | recupera 1 solo doc (correcto), pero el LLM **sigue malinterpretándolo** (invierte martes/jueves) -- ya no es mezcla de docs, es "bug A" puro |
+| `pregunta_compuesta` | con el gate viejo daba falso positivo; sin gate, respondía bien | ✗ **regresión nueva**: el chunk correcto (tiene las dos partes de la respuesta) puntúa **-0.66** con el reranker para esta frase imperativa/compuesta ("Decime X y también Y") -- por debajo de `min_score`, así que abstiene en vez de responder. Confirma exactamente lo que anticipaba el pedido original: esto no es un problema de umbral, es que la pregunta pide DOS datos y ningún chunk aislado los tiene juntos de una forma que el reranker reconozca bien para frases compuestas -- el caso motivador real para la descomposición de preguntas compuestas (siguiente sección). |
 
 ## Testear el LLM/RAG con scripts/eval.py
 
