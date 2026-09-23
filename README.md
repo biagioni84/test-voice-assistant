@@ -323,33 +323,48 @@ objetivo original de <100ms de prefill en la mayoría de los casos.
      (sintaxis PCRE/Python) en vez de `\uXXXX` (sintaxis real de GBNF) -- el parser los toleraba sin
      tirar error pero la gramática no restringía nada de verdad, así que una fuga de CJK pasó igual en
      una corrida completa antes de notarlo. Corregido y verificado con 0 caracteres CJK en 43 casos.
-2. **No borrar el KV cache entre charlas contamina charlas distintas.** Para no perder el prefijo
-   cacheado, se probó NO borrar los slots entre conversaciones (`reset_conversation()`). Bug real: el
-   matching de prefijo de llama-server compara tokens exactos, y si una charla nueva comparte un
-   prefijo largo por casualidad con contenido de una charla anterior sin relación, el server puede
-   servir una completion mezclada con esa cola vieja -- reprodujo el bug de "y ahí" que ya se había
-   arreglado en la ronda anterior. `reset_conversation()` vuelve a borrar los dos slots
-   (`/slots/{id}?action=erase`, requiere `--slot-save-path`); el costo se paga una vez por charla, no
-   por turno -- dentro de la misma charla, los turnos siguientes sí cachean bien.
-3. **"y eso" seguía siendo frágil incluso con el prefijo exacto del few-shot.** Después de arreglar 1
-   y 2, "y eso" todavía fallaba -- diagnosticado a fondo (aislando grammar, cache_prompt, id_slot uno
-   por uno) hasta confirmar que era el modelo mismo, de forma estable y no por empate de logits
-   (probado con distintas seeds y algo de temperature, mismo resultado siempre). El LLM de respuesta
-   genera una frase ligeramente distinta a la del ejemplo few-shot turno a turno (aunque
-   `temperature=0`, porque el CONTEXTO recuperado varía un poco), y el 3B no generalizaba de forma
-   confiable a esa variación. **Fix**: en vez de seguir puliendo el prompt, "referencia vacía" ("y
-   eso", "y ahí", "eso mismo", "lo mismo") se resuelve con una regla determinista
-   (`voice/rewrite.py: is_empty_reference` + `resolve_empty_reference`) que devuelve directamente la
-   última pregunta del historial, sin llamar al LLM -- más simple, 100% confiable, y de paso más
-   rápido para el patrón de follow-up más común.
+2. **"y eso" seguía siendo frágil incluso con el prefijo exacto del few-shot.** Después de arreglar 1,
+   "y eso" todavía fallaba -- diagnosticado a fondo (aislando grammar, cache_prompt, id_slot uno por
+   uno) hasta confirmar que era el modelo mismo, de forma estable y no por empate de logits (probado
+   con distintas seeds y algo de temperature, mismo resultado siempre). El LLM de respuesta genera una
+   frase ligeramente distinta a la del ejemplo few-shot turno a turno (aunque `temperature=0`, porque
+   el CONTEXTO recuperado varía un poco), y el 3B no generalizaba de forma confiable a esa variación.
+   **Fix**: en vez de seguir puliendo el prompt, "referencia vacía" ("y eso", "y ahí", "eso mismo", "lo
+   mismo") se resuelve con una regla determinista (`voice/rewrite.py: is_empty_reference` +
+   `resolve_empty_reference`) que devuelve directamente la última pregunta del historial, sin llamar al
+   LLM -- más simple, 100% confiable, y de paso más rápido para el patrón de follow-up más común.
 
-**Resultado final** (43 casos, `tests/eval_questions.yaml`): **p50≈545-670ms** (bajó de ~870ms, con
-variación entre corridas por el ruido normal de un proceso compartiendo la máquina), sin regresiones
-en identidad/chiste/cambio-de-día, y "y eso" ahora resuelve en 0ms (no llama al LLM). Un caso nuevo
-sigue fallando (`comentario_sin_tema_no_corta_continuidad`: el LLM de respuesta ignora un chunk con
-score muy superior -0.81 vs 0.49- y responde con el menos relevante) -- es la misma familia de "bug A"
-(fidelidad al contexto) que ya estaba documentada como fuera de alcance de este trabajo, no una
-regresión nueva de la migración.
+**Un "bug" que resultó no serlo -- vale la pena documentarlo por la metodología**: al perseguir el
+punto 2, en el camino se sospechó (equivocadamente) que NO borrar el KV cache de los slots entre
+conversaciones distintas causaba contaminación cruzada (el matching de prefijo "mezclando" contenido de
+una charla vieja sin relación). `reset_conversation()` llegó a borrar los dos slots por las dudas. Pero
+un **experimento controlado** lo descartó: correr una charla B (a) desde cero, (b) después de otra
+charla A con `cache_prompt: true`, (c) igual pero `cache_prompt: false` -- **las tres dieron texto
+idéntico**. El matching de prefijo de llama-server compara tokens exactos y solo reusa lo que coincide
+byte a byte; no hay mecanismo por el que pueda mezclar contenido de charlas distintas. La causa real de
+"y ahí" era la del punto 2. Sacado el borrado (no aporta nada demostrado y cuesta latencia real, ver
+abajo).
+
+**Timings por rol, frío vs tibio** (medido directo del campo `timings` de llama-server, no estimado):
+
+| | prompt_n | prompt_ms (frío) | prompt_ms (tibio) | predicted_n | predicted_ms |
+|---|---|---|---|---|---|
+| Reescritor | 570 | 370ms | **27ms** (cache_n=569) | 13 | ~300-420ms |
+| Respuesta | 266 | 173ms | **27ms** (cache_n=265) | 16 | ~400-420ms |
+
+Hallazgo importante: con caché tibio el prefill cae ~93%, pero el **decode no se mueve** (sigue en
+~300-420ms) -- el cacheo solo ahorra reprocesar el prompt, no generar tokens nuevos, que es secuencial
+sí o sí (25-30ms/token, fijo por la velocidad del modelo). Por eso el objetivo original de "<100ms de
+prefill" no se traduce en un total tan bajo: una vez tibio el cuello de botella pasa a ser el decode,
+no el prefill, y eso no depende del cacheo de prompt.
+
+**Resultado final** (43 casos, `tests/eval_questions.yaml`, sin borrado de slots): **p50≈446ms,
+p95≈743ms** cuando el reescritor corre (bajó de ~870ms, mejoró más todavía al sacar el borrado
+innecesario), sin regresiones en identidad/chiste/cambio-de-día, y "y eso" ahora resuelve en 0ms (no
+llama al LLM). Un caso nuevo sigue fallando (`comentario_sin_tema_no_corta_continuidad`: el LLM de
+respuesta ignora un chunk con score muy superior -0.81 vs 0.49- y responde con el menos relevante) --
+es la misma familia de "bug A" (fidelidad al contexto) ya documentada como fuera de alcance, no una
+regresión de esta migración.
 
 **Bug real encontrado en el camino, no relacionado con la latencia**: `Assistant.run()` nunca
 reseteaba `self.llm.history` entre ventanas de conversación separadas (solo `scripts/eval.py` lo

@@ -75,21 +75,19 @@ class LocalLLM:
                 self._proc.kill()
 
     def reset(self) -> None:
-        """Arranca una charla nueva: limpia self.history y borra el KV cache de los dos slots.
+        """Arranca una charla nueva: limpia self.history nada más.
 
-        Se probó NO borrar (para no perder el prefijo estático cacheado entre charlas) y se encontró
-        un bug real: el matching de prefijo de llama-server compara tokens exactos, y si una charla
-        nueva comparte un prefijo largo por casualidad con contenido de una charla anterior sin
-        relación (ej. el mismo prefijo estático + algo de contenido dinámico que coincide un rato),
-        el server puede servir una completion mezclada con esa cola vieja -- reprodujo el bug de
-        "y ahí" que ya se había arreglado. Borrar es lo seguro. El costo se paga una vez por charla
-        (no por turno): dentro de la MISMA charla, los turnos siguientes sí cachean bien."""
+        NO se borra el KV cache de los slots. Se había agregado un borrado acá por una sospecha de
+        contaminación entre charlas (el bug de "y ahí" parecía reaparecer sin relación con el
+        contenido cacheado) -- pero un experimento controlado (correr una charla B (a) desde cero,
+        (b) después de otra charla A con cache_prompt=true, (c) igual pero cache_prompt=false) dio
+        el mismo resultado exacto en los tres casos. El matching de prefijo de llama-server compara
+        tokens exactos y solo reusa lo que coincide byte a byte; no hay mecanismo por el que pueda
+        "mezclar" contenido de una charla con otra. La causa real de "y ahí" era otra (ver
+        voice/rewrite.py: is_empty_reference) y quedó resuelta aparte. Dejar el cache intacto entre
+        charlas es seguro y más rápido: el prefijo estático del reescritor queda tibio incluso para
+        la primera charla nueva."""
         self.history.clear()
-        for slot in (SLOT_REWRITE, SLOT_ANSWER):
-            try:
-                requests.post(f"{self.base_url}/slots/{slot}", params={"action": "erase"}, timeout=5)
-            except requests.RequestException:
-                pass
 
     def record_turn(self, question: str, answer: str) -> None:
         """Guarda la pregunta ORIGINAL del usuario (no la reescrita) y la respuesta -- así el
