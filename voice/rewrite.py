@@ -17,20 +17,39 @@ mirar la última pregunta del usuario en el historial. Más rápido además (sin
 
 import json
 import re
+import unicodedata
 
 # "y eso", "eso", "y ahí", "¿y ahí?", "eso mismo", "lo mismo", con o sin "¿...?" -- referencias que
 # no traen ningún dato nuevo, solo piden repetir/continuar sobre la última pregunta
 _EMPTY_REF_RE = re.compile(r"^[¿\s]*(y\s+)?(eso( mismo)?|ah[ií]|lo mismo)[\.\?\s]*$", re.IGNORECASE)
 
-SYSTEM_PROMPT = """Reescribí la última pregunta del usuario como una pregunta autónoma que se
+SYSTEM_PROMPT = """Reescribí la última entrada del usuario como una pregunta autónoma que se
 entienda sin el historial de la charla. Resolvé referencias ("y el domingo", "eso", "ahí") usando
 el historial: reemplazá la referencia por el sustantivo/tema real al que apunta, tomado del
-historial. Si la pregunta actual es solo una referencia vacía sin ningún dato nuevo ("y eso",
-"¿y ahí?", "decime de nuevo"), la reescritura es directamente la pregunta anterior completa, tal
-cual, no una versión abreviada con "eso". Si el usuario corrige algo ("no, te pregunté por el
-sábado"), la pregunta reescrita usa la corrección, no lo que se había hablado antes. No respondas
-la pregunta. No agregues información que no esté en el historial ni en la pregunta actual. Devolvé
-SOLO la pregunta reescrita, nada más -- sin explicaciones ni comillas."""
+historial -- arrastrá TODAS las entidades relevantes del turno anterior (sujeto, lugar, persona) a
+la pregunta reescrita, no solo el dato nuevo que aporta la entrada actual ("todos los días abre a
+las diez" después de hablar de "la oficina" tiene que seguir mencionando "la oficina", no perderla).
+Preservá el TIPO de pregunta del turno anterior: si era de sí o no ("¿abre la oficina?"), la
+reescrita también tiene que ser de sí o no, no una de qué/cuándo/cómo, a menos que el usuario haya
+cambiado explícitamente el tipo de pregunta.
+
+Si la entrada actual es solo una referencia vacía sin ningún dato nuevo ("y eso", "¿y ahí?", "decime
+de nuevo"), la reescritura es directamente la pregunta anterior completa, tal cual, no una versión
+abreviada con "eso". Si el usuario corrige algo ("no, te pregunté por el sábado"), la pregunta
+reescrita usa la corrección, no lo que se había hablado antes.
+
+La entrada puede venir como una AFIRMACIÓN en vez de una pregunta: en español hablado, las
+confirmaciones de sí o no suelen sonar como afirmaciones con entonación ("todos los días abre a las
+diez") y llegan transcriptas sin signos de interrogación. Convertí esas afirmaciones en una pregunta
+de confirmación de sí o no que combine el dato nuevo con el sujeto/tema del historial (si hay
+historial) -- esto vale AUNQUE la afirmación ya suene como una oración completa y gramaticalmente
+autónoma ("todos los días abre a las diez" se entiende sola, pero igual está omitiendo el sujeto
+real del historial; agregalo lo mismo, no la dejes "como está" solo porque ya es una oración
+entera). Esto aplica también sin historial: si la entrada es una afirmación aislada (primer turno de
+la charla), convertila en pregunta igual, aunque no haya sujeto del historial para completarla.
+
+No respondas la pregunta. No agregues información que no esté en el historial ni en la entrada
+actual. Devolvé SOLO la pregunta reescrita, nada más -- sin explicaciones ni comillas."""
 # (probado y descartado: una versión condensada de este prompt, ~130 tokens en vez de ~240, parecía
 # preservar el significado pero era una instrucción más débil -- fallaba justo en el caso de "y eso"
 # con texto de respuesta REAL del LLM (no el texto exacto de los ejemplos few-shot). El ahorro de
@@ -61,6 +80,51 @@ _EXAMPLES: list[tuple[list[tuple[str, str]], str, str]] = [
         [("¿A qué hora abre la oficina los sábados?", "Los sábados abre de diez a una de la tarde.")],
         "¿Por qué demoras tanto en responder?",
         "¿Por qué demoras tanto en responder?",
+    ),
+    (
+        # sujeto elidido + preservar tipo sí/no (bug real: sin esto daba "¿Cuándo abre todos los
+        # días?", perdiendo "la oficina" Y cambiando sí/no por qué/cuándo)
+        [("¿A qué hora abre la oficina?", "Abre a las diez de la mañana.")],
+        "todos los días",
+        "¿La oficina abre todos los días?",
+    ),
+    (
+        # afirmación (sin "?") como confirmación de sí/no, CON historial -- arrastra el sujeto.
+        # A PROPÓSITO usa un tema distinto (sala de reuniones) al de arriba (oficina/horario): 3
+        # ejemplos seguidos casi idénticos en tema hacían que el 3B, ante una entrada nueva sin
+        # relación, "completara el patrón" repitiendo el ejemplo más parecido en vez de generalizar
+        # -- bug real encontrado (23/09, ver README) con "El estacionamiento tiene doce lugares."
+        # (primer turno, sin relación con oficina/horarios) devolviendo textual la salida de OTRO
+        # few-shot. Diversificar el tema de cada ejemplo evita que el modelo tenga un solo patrón
+        # de superficie para copiar.
+        [("¿Cuántas personas entran en la sala Norte?", "Tiene capacidad para diez personas.")],
+        "Se puede reservar hasta por dos horas seguidas.",
+        "¿La sala Norte se puede reservar hasta por dos horas seguidas?",
+    ),
+    (
+        # variante con "Y" al principio y dos turnos de historial -- bug real (23/09): con una
+        # oración COMPLETA (no un fragmento suelto como "todos los días") el modelo tendía a tratar
+        # la afirmación como si ya se bastara sola y perdía el sujeto igual; el "Y" inicial
+        # empeoraba todavía más la pérdida del sujeto. A propósito usa "la oficina" de nuevo (mismo
+        # sustantivo genérico que el primer ejemplo, no un dato específico de los docs) pero con
+        # datos y pregunta DISTINTOS a los de la conversación real que disparó el bug (ver
+        # tests/eval_questions.yaml: validation_sujeto_elidido_y_afirmacion) -- sin esto, un tema
+        # totalmente distinto (wifi) no alcanzaba para que el modelo generalizara el patrón
+        # "Y + oración completa + mismo sujeto que el historial", ver README.
+        [
+            ("¿A qué hora cierra la oficina?", "Cierra a las seis de la tarde."),
+            ("¿Y los feriados?", "No abre los feriados."),
+        ],
+        "Y abre normalmente los fines de semana.",
+        "¿La oficina abre normalmente los fines de semana?",
+    ),
+    (
+        # afirmación aislada, SIN historial (primer turno de la charla), tema distinto de todos
+        # los anteriores (vacaciones) -- se convierte a pregunta igual, aunque no haya sujeto del
+        # historial para completarla
+        [],
+        "Las vacaciones se piden con dos semanas de anticipación.",
+        "¿Las vacaciones se piden con dos semanas de anticipación?",
     ),
 ]
 
@@ -108,6 +172,59 @@ def looks_like_question(text: str) -> bool:
     return True
 
 
+# signos que terminan una oración -- ver TERMINAL_PUNCT_CHARS y el bug real documentado en llm.py:
+# rewrite_query (reponer "?" sin chequear esto daba salidas como "...de la mañana.?")
+TERMINAL_PUNCT_CHARS = ".?!…"
+
+# arranca con una palabra interrogativa (con o sin "¿" adelante) -- si matchea, el texto YA tiene
+# pinta de pregunta y no hace falta pasarlo por looks_like_statement
+_INTERROGATIVE_START_RE = re.compile(
+    r"^[¿\s]*(qu[eé]|cu[aá]les?|c[oó]mo|cu[aá]ndo|d[oó]nde|ad[oó]nde|qui[eé]nes?|"
+    r"cu[aá]nt[oa]s?|por\s+qu[eé])\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_statement(question: str) -> bool:
+    """Verdadero si la entrada NO tiene pinta de pregunta ya formada -- ni termina en "?" ni arranca
+    con una palabra interrogativa. En voz hablada, las confirmaciones de sí/no muchas veces salen
+    como afirmaciones con entonación ("todos los días abre a las diez") y Whisper las transcribe sin
+    signos -- esto dispara el reescritor para convertirlas en pregunta, incluso en el primer turno
+    (sin historial, ver LocalLLM.rewrite_query). Sesgado a recall igual que looks_compound: un falso
+    positivo sobre una entrada que en realidad no había que tocar (chitchat, comando imperativo)
+    solo cuesta latencia -- is_near_identical() abajo actúa de red de seguridad si el modelo la deja
+    prácticamente igual (señal de que no había nada que convertir)."""
+    q = question.strip()
+    if not q or q.endswith("?"):
+        return False
+    if _INTERROGATIVE_START_RE.match(q):
+        return False
+    return True
+
+
+def _normalize_for_compare(s: str) -> str:
+    # OJO: a propósito NO se saca el "¿" inicial -- agregarlo es justo la señal de que el modelo SÍ
+    # convirtió la afirmación en pregunta (ver is_near_identical). Solo se saca puntuación de CIERRE
+    # (".", "!", "…", "?"), que es cosmética y no indica si hubo una reescritura real.
+    s = s.strip()
+    s = s.rstrip(TERMINAL_PUNCT_CHARS).strip()
+    s = unicodedata.normalize("NFKD", s.lower())
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+def is_near_identical(rewritten: str, original: str) -> bool:
+    """Compara normalizado (minúsculas, sin acentos, sin puntuación de cierre -- pero SÍ
+    conservando un "¿" inicial si lo hay) -- si son prácticamente iguales, el modelo no reescribió
+    de verdad, solo repitió la entrada tal cual (a lo sumo con un "?" pegado por la lógica de
+    reposición del stop, ver LocalLLM.rewrite_query). Importante cuando `original` era una
+    afirmación sin forma de pregunta (looks_like_statement): si el modelo SÍ la envolvió en "¿...?"
+    -- aunque no haya cambiado ninguna otra palabra -- eso YA es una conversión válida (el punto de
+    looks_like_statement es justo convertir "todos los días abre a las diez" en "¿todos los días
+    abre a las diez?", no reformular más que eso) y no debe rechazarse; si en cambio el modelo
+    devolvió el texto sin el "¿" inicial (no lo convirtió en absoluto), esto lo agarra."""
+    return _normalize_for_compare(rewritten) == _normalize_for_compare(original)
+
+
 # ============================================================================
 # Descomposición de preguntas compuestas (punto 4). Ver LocalLLM.rewrite_query en voice/llm.py.
 #
@@ -117,11 +234,16 @@ def looks_like_question(text: str) -> bool:
 # eso looks_compound() se evalúa siempre, independiente de self.history.
 # ============================================================================
 
-# Palabras interrogativas del español (con variantes de género/número) -- dos DISTINTAS en la misma
-# pregunta son una señal de que hay dos pedidos distintos ("¿cuándo... y dónde...?").
+# Palabras interrogativas del español -- dos DISTINTAS en la misma pregunta son una señal de que
+# hay dos pedidos distintos ("¿cuándo... y dónde...?"). A propósito exige la TILDE en todas: sin
+# ella, "que"/"como"/"cuando"/"donde" son conjunciones/relativos comunísimos en cualquier oración
+# ("dije QUE eran", "trabajo COMO profesor", "el lugar DONDE vivo") -- BUG real encontrado (23/09):
+# "¿y cuántos días dije que eran?" (un solo pedido, de seguimiento) disparaba looks_compound porque
+# "que" (el relativo, sin tilde) matcheaba como si fuera "qué" interrogativo, sumando 2 con
+# "cuántos". La tilde es justo lo que en español distingue el uso interrogativo del relativo/
+# conjunción -- Whisper la pone cuando transcribe una pregunta real.
 _INTERROGATIVE_RE = re.compile(
-    r"\b(qu[eé]|cu[aá]les?|c[oó]mo|cu[aá]ndo|d[oó]nde|ad[oó]nde|qui[eé]nes?|"
-    r"cu[aá]nt[oa]s?|por\s+qu[eé])\b",
+    r"\b(qué|cuáles?|cómo|cuándo|dónde|adónde|quiénes?|cuánt[oa]s?|por\s+qué)\b",
     re.IGNORECASE,
 )
 # conectores típicos de enumerar dos pedidos en el mismo turno

@@ -21,7 +21,7 @@ import requests
 
 from . import rewrite
 from .config import LlmCfg, RewriteCfg, resolve
-from .guardrails import CJK_GRAMMAR
+from .guardrails import CJK_GRAMMAR, is_chitchat
 
 SLOT_REWRITE = 0
 SLOT_ANSWER = 1
@@ -54,14 +54,27 @@ class LocalLLM:
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _wait_ready(self, timeout: float = 90.0) -> None:
+        """`/health` solo -- BUG real encontrado (23/09): a veces responde 200 "ok" mientras el
+        modelo todavía está cargando (el binding del puerto ocurre antes de "loading model" en el
+        log de llama-server), y la primera petición real de verdad ("¿A qué se dedica la empresa y
+        a qué hora abre la oficina los sábados?", ver README) recibía 503 "Loading model" en vez de
+        una respuesta -- KeyError: 'choices' en _decompose/rewrite_query porque el código esperaba
+        siempre una respuesta bien formada. Se agrega una prueba de inferencia real (1 token) además
+        del /health -- no declara listo hasta que el servidor efectivamente puede generar."""
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             if self._proc.poll() is not None:
                 raise RuntimeError(f"llama-server terminó solo (exit code {self._proc.returncode}) -- revisar {self.cfg.server_bin}")
             try:
                 if requests.get(f"{self.base_url}/health", timeout=1).ok:
-                    return
-            except requests.RequestException:
+                    probe = requests.post(
+                        f"{self.base_url}/v1/chat/completions",
+                        json={"model": "local", "messages": [{"role": "user", "content": "hola"}], "max_tokens": 1},
+                        timeout=10,
+                    )
+                    if probe.ok and "choices" in probe.json():
+                        return
+            except (requests.RequestException, ValueError):
                 pass
             time.sleep(0.3)
         raise RuntimeError("llama-server no respondió a tiempo en /health")
@@ -132,10 +145,15 @@ class LocalLLM:
         solo elemento (comportamiento de siempre); trae más de uno solo si voice/rewrite.py:
         looks_compound() disparó Y el reescritor devolvió una descomposición válida.
 
-        A diferencia de la reescritura de seguimiento (que no tiene sentido sin historial: no hay
-        nada que resolver), la detección de preguntas compuestas se evalúa en CUALQUIER turno,
-        incluido el primero -- "decime el horario de lunes a viernes y también el de los sábados"
-        puede ser la primera frase de la charla."""
+        Dos casos disparan la reescritura AUNQUE NO HAYA HISTORIAL (a diferencia de la reescritura
+        de seguimiento "clásica", que no tiene sentido sin turno anterior que resolver):
+          - looks_compound(): una pregunta compuesta puede ser la primera frase de la charla.
+          - looks_like_statement(): en voz hablada, una confirmación de sí/no suena como afirmación
+            ("todos los días abre a las diez") y Whisper la transcribe sin "?" -- convertirla a
+            pregunta ayuda al retrieval igual aunque no haya sujeto del historial para completarla
+            (ver voice/rewrite.py: SYSTEM_PROMPT, ejemplo sin historial). Se excluye charla social
+            reconocida (is_chitchat) para no pagar la llamada en comandos/imperativos que no son
+            afirmaciones a convertir ("Contame un chiste.", "Decime la hora.")."""
         if not self.rewrite_cfg.enabled:
             return [question], False
 
@@ -148,10 +166,13 @@ class LocalLLM:
             # no validó (JSON roto, etc.) -- sigue el camino normal de abajo con la pregunta tal
             # cual, que todavía puede beneficiarse de la reescritura de seguimiento si hay historial
 
-        if not self.history:
+        needs_rewrite = bool(self.history) or (
+            rewrite.looks_like_statement(question) and not is_chitchat(question)
+        )
+        if not needs_rewrite:
             return [question], False
 
-        if rewrite.is_empty_reference(question):
+        if self.history and rewrite.is_empty_reference(question):
             resolved = rewrite.resolve_empty_reference(pairs)
             if resolved:
                 return [resolved], True
@@ -170,16 +191,32 @@ class LocalLLM:
         resp = self._post(
             messages, SLOT_REWRITE, self.rewrite_cfg.max_tokens, 0.0, stream=False, stop=["?", "\n"]
         ).json()
-        choice = resp["choices"][0]
-        out = choice["message"]["content"].strip()
-        if choice.get("finish_reason") == "stop" and out and not out.endswith("?") and "\n" not in out:
+        extracted = self._extract_choice(resp)
+        if extracted is None:
+            # respuesta malformada/error transitorio del servidor (ver _wait_ready) -- se cae al
+            # camino de siempre en vez de reventar el turno entero
+            return [question], False
+        out, finish_reason = extracted
+        # BUG real (23/09): "out" puede terminar en "." en vez de "?" (el modelo cerró la oración
+        # sola, sin que el stop la cortara) -- reponer "?" sin chequear esto daba "...mañana.?". Solo
+        # se repone si NO hay ya un signo de cierre (".", "!", "…", "?").
+        if (
+            finish_reason == "stop"
+            and out
+            and out[-1] not in rewrite.TERMINAL_PUNCT_CHARS
+            and "\n" not in out
+        ):
             # el endpoint OpenAI-compatible de llama-server no distingue CUÁL de los dos stops se
             # disparó (no expone un "stopping_word" como el endpoint nativo /completion) -- si el
-            # texto no tiene "\n" y le falta el "?" final, la explicación más probable con mucha
-            # diferencia es que cortó justo por "?" (el few-shot condiciona fuerte a una sola línea
-            # corta terminada en "?"); reponerlo acá evita descartar reescrituras buenas solo por
-            # esta ambigüedad del endpoint. looks_like_question() igual filtra por longitud después.
+            # texto no tiene "\n" y no termina en ningún signo de cierre, la explicación más
+            # probable con mucha diferencia es que cortó justo por "?" (el few-shot condiciona
+            # fuerte a una sola línea corta terminada en "?"); reponerlo acá evita descartar
+            # reescrituras buenas solo por esta ambigüedad del endpoint.
             out = out + "?"
+        # BUG real (23/09): si la entrada era una afirmación (sin "?") y el modelo la devolvió
+        # prácticamente igual, no la convirtió de verdad -- no vale como reescritura.
+        if rewrite.looks_like_statement(question) and rewrite.is_near_identical(out, question):
+            return [question], False
         if rewrite.looks_like_question(out):
             return [out], True
         return [question], False
@@ -197,8 +234,26 @@ class LocalLLM:
         resp = self._post(
             messages, SLOT_REWRITE, self.rewrite_cfg.max_tokens * 3, 0.0, stream=False
         ).json()
-        out = resp["choices"][0]["message"]["content"].strip()
+        extracted = self._extract_choice(resp)
+        if extracted is None:
+            return None  # respuesta malformada/error transitorio -- cae al camino normal (no descompone)
+        out, _ = extracted
         return rewrite.parse_subquestions(out)
+
+    @staticmethod
+    def _extract_choice(resp: dict) -> tuple[str, str | None] | None:
+        """(contenido, finish_reason) de una respuesta no-streaming, o None si vino malformada --
+        p.ej. un 503 "Loading model" (ver _wait_ready) u otro error transitorio del servidor.
+        Nunca revienta con KeyError: mejor caer al camino "no reescribió"/"no descompuso" de
+        siempre que un turno entero sin responder."""
+        choices = resp.get("choices")
+        if not choices:
+            return None
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if content is None:
+            return None
+        return content.strip(), choices[0].get("finish_reason")
 
     def _stream_from_messages(self, messages: list[dict]) -> Iterator[str]:
         r = self._post(messages, SLOT_ANSWER, self.cfg.max_tokens, self.cfg.temperature, stream=True)

@@ -102,6 +102,16 @@ class TtsCfg:
 
 
 @dataclass
+class CanonicalCfg:
+    """Respuestas canónicas (FAQ con texto fijo) -- ver voice/canonical.py. Se evalúan ANTES del
+    RAG, por (sub)pregunta: si matchea, se responde con el texto tal cual, sin llamar al LLM."""
+    enabled: bool = True
+    path: str = "tests/canonical_answers.yaml"
+    reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"  # mismo modelo que rag.reranker_model
+    threshold: float = 2.0  # PROVISORIO, atado al contenido de path -- ver scripts/calibrate.py
+
+
+@dataclass
 class Config:
     audio: AudioCfg
     wakeword: WakeCfg
@@ -110,6 +120,7 @@ class Config:
     rag: RagCfg
     llm: LlmCfg
     rewrite: RewriteCfg
+    canonical: CanonicalCfg
     tts: TtsCfg
 
 
@@ -126,19 +137,21 @@ def load_config(path: str | Path | None = None) -> Config:
 
 
 def _apply_calibration(cfg: Config) -> None:
-    """Superpone calibration.toml (generado por scripts/calibrate.py, ver tests/calibration_questions.yaml)
-    sobre los umbrales de RagCfg, si ese archivo existe. config.toml sigue siendo la fuente de los
-    valores default/documentados (para un checkout nuevo sin haber corrido la calibración todavía);
-    calibration.toml, si está, los pisa. Así recalibrar para documentos reales es correr
+    """Superpone calibration.toml (generado por scripts/calibrate.py, ver
+    tests/calibration_questions.yaml y tests/calibration_canonical.yaml) sobre los umbrales de
+    RagCfg/CanonicalCfg, si ese archivo existe. config.toml sigue siendo la fuente de los valores
+    default/documentados (para un checkout nuevo sin haber corrido la calibración todavía);
+    calibration.toml, si está, los pisa. Así recalibrar para documentos/contenido reales es correr
     `python scripts/calibrate.py` de nuevo, sin tocar config.toml a mano -- ver README, sección
     "parámetros calibrados vs. arquitectura estable"."""
     path = ROOT / "calibration.toml"
     if not path.exists():
         return
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    for key, value in raw.get("rag", {}).items():
-        if hasattr(cfg.rag, key):
-            setattr(cfg.rag, key, value)
+    for section_name, section_cfg in (("rag", cfg.rag), ("canonical", cfg.canonical)):
+        for key, value in raw.get(section_name, {}).items():
+            if hasattr(section_cfg, key):
+                setattr(section_cfg, key, value)
 
 
 def resolve(p: str | Path) -> Path:

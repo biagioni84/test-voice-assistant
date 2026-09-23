@@ -593,8 +593,8 @@ El "cambio de día en un follow-up" que quedaba roto ahí se arregló con la ree
 ver esa sección más arriba. El estado actual, más las rondas de latencia/dev-validación/chunking, está
 resumido abajo.)*
 
-**Estado actual (22/09/2026, `tests/eval_questions.yaml`, 76 turnos entre dev y validación, con el
-reranker + calibración + descomposición de preguntas compuestas):**
+**Estado actual (23/09/2026, `tests/eval_questions.yaml`, ~90 turnos entre dev y validación, con
+reranker + híbrido + calibración + descomposición + respuestas canónicas + fixes de sujeto/afirmación):**
 
 | Área | Estado |
 |---|---|
@@ -603,13 +603,19 @@ reranker + calibración + descomposición de preguntas compuestas):**
 | Identidad inventada, nombre común, multi-turno, chiste (guardrails deterministas) | ✓ sin regresión |
 | Validación holdout de reescritura (formulaciones nuevas, no usadas para ajustar el prompt) | 2/4 generalizan bien; 2/4 no resuelven pero abstienen seguro (nunca alucinan) |
 | Cross-doc ambiguo (`retrieval_ambiguo_dos_docs`) | 2/3 abstienen honestamente (ningún doc solo cruza claro); 1/3 recupera 1 doc correcto pero el LLM lo malinterpreta -- "bug A", no de retrieval |
-| `pregunta_compuesta` | ✓ **arreglado** con la descomposición (punto 4, ver esa sección) -- responde ambas partes |
-| Descomposición, 4 casos nuevos de validación (primer turno, seguimiento, parte fuera de dominio, imperativa) | ✓ **4/4** |
-| Falsos positivos del pre-filtro de preguntas compuestas sobre preguntas no-compuestas | 1/63 (2%) |
+| Descomposición de preguntas compuestas (dev + 4 casos de validación) | ✓ sin regresión, `pregunta_compuesta` arreglado |
+| Falsos positivos del pre-filtro de preguntas compuestas sobre preguntas no-compuestas | 0/88 (0%) tras arreglar `_INTERROGATIVE_RE` (matcheaba "que" sin tilde como interrogativo) |
+| Sujeto elidido + afirmación-como-pregunta (nuevo, ver sección de bugs en vivo) | ✓ patrón general confiable en varios temas; 1 caso conocido (oración ya completa, sin remisión al sujeto) degrada seguro en vez de alucinar |
+| Respuestas canónicas (nuevo): matches, falsos positivos, compuesta mixta, texto exacto, rotación, "repetí" | ✓ **14/14**, todo como aserciones automáticas |
+| Persistencia de historial (chequeo automático nuevo, todo turno) | ✓ sin fallos |
 | `comentario_sin_tema_no_corta_continuidad` (turno del medio) | ✓ sin regresión |
 | 0 caracteres CJK en toda la corrida | ✓ |
 
 Todo documentado con el detalle completo en `tests/eval_questions.yaml` y en las secciones de arriba.
+Tres chequeos del harness ya son **automáticos** (exit code != 0 si fallan, no juicio humano):
+`expect_n_subquestions`, persistencia de historial, y las aserciones de respuestas canónicas -- el
+resto sigue siendo juicio humano/Claude leyendo el Markdown, con una conversión progresiva a
+aserciones automáticas pendiente (empezando por los casos de seguridad: abstención, identidad, CJK).
 
 ## Independencia de los documentos: calibración vs. arquitectura
 
@@ -748,6 +754,154 @@ confirmando que el chequeo tiene dientes.
 **Diferido a propósito** (per el pivot de documentos genéricos): lookup estructurado de horarios y
 la comparación 3B vs. 7-8B quedan para cuando existan documentos reales.
 
+## Bugs de una prueba en vivo (23/09): sujeto elidido, afirmaciones, historial silencioso
+
+Una conversación real (`--no-wake`, sin mic) expuso varios bugs que el harness no cubría:
+
+```
+🗣  ¿Qué hora abre la oficina?          🤖 Diez de la mañana.
+🗣  todos los días                      (reescrita: '¿Cuándo abre todos los días?') 🤖 No lo encontré...
+🗣  Y todos los días abre a las 10...    (reescrita: '...mañana.?')                 🤖 No lo encontré...
+🗣  Todos los días abre a las 10...      (sin historial, rewrite=0ms)                🤖 No tengo información...
+```
+
+**1) El reescritor perdía el sujeto y cambiaba el tipo de pregunta.** "todos los días" (sí/no,
+sujeto "la oficina" elidido) se reescribía a "¿Cuándo abre todos los días?" -- perdía "la oficina"
+Y cambiaba sí/no por qué/cuándo. `SYSTEM_PROMPT` y los few-shot ahora exigen explícitamente arrastrar
+TODAS las entidades del turno anterior (no solo el dato nuevo) y preservar el tipo de pregunta.
+Verificado con distintos temas (oficina, wifi, sala de reuniones, estacionamiento): el patrón
+general de sujeto elidido generaliza bien; una oración YA gramaticalmente completa sin ninguna
+palabra que remita al sujeto ("Y todos los días abre a las 10 de la mañana") sigue siendo un límite
+real del 3B en algunos casos -- documentado como tal en vez de forzado con un few-shot calcado del
+caso puntual (ver `validation_sujeto_elidido_y_afirmacion`); lo importante es que degrada seguro
+(abstiene honesto) en vez de alucinar o corromper texto.
+
+**Lección de few-shot -- overfitting de superficie**: la primera versión de los few-shot nuevos
+usaba el mismo tema (oficina/horarios) en 3 ejemplos seguidos. Con una entrada nueva sin relación
+("El estacionamiento tiene doce lugares.", primer turno), el 3B directamente devolvía **el texto de
+otro few-shot**, textual -- había memorizado el patrón de superficie en vez de generalizar.
+Diversificar el tema de cada ejemplo (oficina / sala de reuniones / wifi / vacaciones) lo arregló.
+Documentado en el código porque es una lección reusable, no específica de este bug.
+
+**2) Afirmaciones sin "?" no se reescribían.** En voz hablada, una confirmación de sí/no suena como
+afirmación con entonación ("todos los días abre a las diez") y Whisper la transcribe sin signos de
+pregunta -- el reescritor ni se ejecutaba (dependía de que hubiera historial). `voice/rewrite.py:
+looks_like_statement()` (determinista, sin LLM) detecta entradas sin "?" ni palabra interrogativa al
+inicio y dispara el reescritor **en cualquier turno, incluido el primero sin historial** -- excluye
+`is_chitchat` para no pagar la llamada en comandos/insultos ("Contame un chiste.") que no son
+afirmaciones a convertir.
+
+**3) Dos bugs de validación.** (a) Reponer el "?" del stop-sequence (ver sección de arriba) no
+chequeaba si el texto ya terminaba en OTRO signo de cierre -- daba `"...mañana.?"`. Ahora se compara
+contra `rewrite.TERMINAL_PUNCT_CHARS` (`.?!…`), no solo `"?"`. (b) Si la entrada era una afirmación y
+el modelo la devolvió prácticamente igual (no la convirtió), esa "reescritura" se rechaza
+(`rewrite.is_near_identical`) y cae a la pregunta original -- con un cuidado no obvio: la comparación
+NO saca el "¿" inicial antes de comparar (a diferencia de la puntuación de cierre), porque agregarlo
+es justo la señal de que el modelo sí convirtió la afirmación; sacarlo daba falsos "no convirtió nada"
+sobre conversiones válidas.
+
+**4) Historial "perdido" en el 4º turno.** Investigado a fondo: `record_turn()` se llama
+sin excepción en los dos caminos de salida de `Assistant.answer()` (confirmado por lectura de
+código, y ahora por un chequeo automático en `scripts/eval.py` que verifica que
+`self.llm.history` crezca en +2 en cada turno). La causa real era otra: `Assistant.run()` solo
+imprimía el aviso de "charla reiniciada" cuando había wake word configurado -- sin wake word
+(`--no-wake`), un reset legítimo por `followup_s` (silencio de más de 5s entre turnos) pasaba
+**sin ningún aviso visible**, indistinguible de un bug. Arreglado: el aviso ahora sale siempre.
+
+**5) Observabilidad**: `Turn.retrieval_trace` (nuevo) guarda, por sub-pregunta, el chunk top-1 y su
+score AUNQUE no haya cruzado `min_score` -- antes "no se recuperó nada" y "se recuperó con score
+bajo" se veían idénticos en el log (`RAG: *(sin contexto)*`). Ahora, cuando no hay hits,
+`scripts/eval.py` y `Assistant.print_metrics` muestran `top1=<doc>@<score> (min_score=<umbral>)`.
+
+**6) Corrección de premisa**: "¿La oficina abre todos los días?" contra un chunk que dice "lunes a
+viernes" -- una vez arreglado el bug 1 (retrieval encuentra el chunk correcto), el LLM de respuesta
+**ya corrige la premisa por sí solo** ("No, abre de lunes a viernes...", "No, solo los sábados..."),
+gracias a la instrucción de honestidad que ya tenía el `system_prompt`. No hizo falta tocar nada
+más -- era un efecto secundario del bug 1, no un problema aparte.
+
+**Harness**: `rewrite_sujeto_elidido_sino`, `rewrite_afirmacion_como_confirmacion`,
+`rewrite_afirmacion_primer_turno` (`type: rewrite`, temas distintos entre sí -- ver la lección de
+arriba) y `correccion_de_premisa` en dev; `validation_sujeto_elidido_y_afirmacion` (la conversación
+real completa) en validación.
+
+## Respuestas canónicas (FAQ, texto fijo)
+
+Ciertas preguntas frecuentes se responden mejor con un texto fijo, redactado por la empresa, que con
+algo generado por el LLM: cero riesgo de alucinación en las preguntas más comunes, control total del
+mensaje, y latencia mínima (no hay decodificación de tokens). Convive con el RAG: si una
+(sub)pregunta matchea una entrada canónica, se responde con su texto tal cual; si no, sigue el
+pipeline normal.
+
+**Contenido de prueba, no definitivo**: `tests/canonical_answers.yaml` tiene 5 entradas inventadas
+(a qué se dedica la empresa, ubicación, contacto, historia, horario de atención al público -- esta
+última a propósito se solapa en TEMA con `docs/oficina.md`, para probar que la canónica gana
+prioridad). Se prueba el **mecanismo**, no el contenido -- cuando exista contenido real, se
+reemplaza ese archivo entero (mismo formato) y se recalibra (ver más abajo).
+
+**Formato** (por entrada): `id` único, `formulaciones` (3-6 formas de preguntar lo mismo, para el
+matching) y `respuestas` (1+ variantes de texto -- todas deben decir lo mismo; si se actualiza un
+dato, hay que cambiarlo en TODAS). Validado al cargar (`voice/canonical.py:
+load_canonical_entries`), rechaza el archivo con un error que nombra la entrada si: hay ids
+duplicados, algún campo está vacío, o una formulación es prácticamente igual a una ya usada en OTRA
+entrada (dos entradas no pueden competir por la misma frase).
+
+**Lint para voz** (warnings al cargar, no bloquean): dígitos o formatos tipo "9-13hs" (Piper lee
+mejor los números en palabras), abreviaturas ("Av.", "Sr.", "etc."), viñetas o markdown, más de ~80
+palabras, y variantes de respuesta de largos muy distintos entre sí (probablemente no dicen lo
+mismo). Todo lo que se lee en voz alta, no se muestra como texto.
+
+**Dónde corre en el pipeline** (`voice/pipeline.py: Assistant.answer()`): **después** de
+reescritura/descomposición, **antes** del RAG -- por cada sub-pregunta, se prueba primero contra
+canonical; si matchea, esa sub-pregunta ya está resuelta y ni siquiera llega al RAG. El matching
+reusa el mismo mecanismo de reranker cross-encoder que el RAG (`fastembed.rerank.cross_encoder`),
+pero contra las formulaciones canónicas en vez de los chunks de documentos -- sin normalizar/pesar
+contra el coseno, porque acá no hay coseno de por medio, es reranker solo. Una pregunta compuesta
+mixta (una parte canónica, otra no) responde la parte canónica textual y la otra por RAG/LLM,
+concatenadas -- el LLM nunca toca el texto canónico.
+
+**Rotación de variantes, determinista** (`CanonicalMatcher._next_variant`): conversación nueva
+siempre empieza por la variante 1; si la misma entrada vuelve a matchear en la misma conversación,
+usa la siguiente no usada, y al agotarlas vuelve a la 1 (módulo). El estado vive en la conversación
+(`Assistant.reset_conversation()` lo resetea junto con el historial). "Repetí" / "¿cómo?" / "no te
+escuché" (`guardrails.is_repeat_request`, nuevo patrón determinista en la lista blanca de charla
+social) repite la ÚLTIMA respuesta dada tal cual -- canónica o no -- sin rotar ni volver a generar.
+
+**Calibración del umbral** (`canonical.threshold`, PROVISORIO): igual mecanismo que
+`rag.min_score` -- `scripts/calibrate.py` barre umbrales contra `tests/calibration_canonical.yaml`
+(preguntas etiquetadas `match`/`no_match`), priorizando **precisión** por sobre recall: si una
+canónica no matchea, cae al RAG (sin drama); si matchea la entrada EQUIVOCADA, o matchea algo que no
+debía matchear nada, recita con total confianza un texto que no corresponde -- ese es el error caro.
+Con el threshold=2.0 puesto a mano inicialmente (una simple suposición), hasta una formulación
+**idéntica** a una del propio archivo puntuaba apenas 1.68 -- confirmando que había que calibrar de
+verdad, no adivinar. Calibrado (0.23): 12/14 casos `match` resueltos bien, 0 casos peligrosos.
+
+**Verificado con `scripts/eval.py`**, todo como aserciones **automáticas** (`expect_canonical_entries`
+/ `expect_exact_text` / `expect_variant_rotation` / `expect_repeat_of_previous` -- exit code != 0 si
+fallan, no juicio humano): matches correctos por entrada (incluida una imperativa y una como
+follow-up), 3 falsos positivos que NO deben matchear (persona con el mismo verbo, área puntual en
+vez de la empresa entera, "baño" vs. "dirección"), fuera de dominio sigue abstenido, compuesta mixta,
+texto exacto carácter por carácter, rotación de variantes (1→2→3→1) y "repetí" sin rotar. De las
+formulaciones nuevas probadas, 3 cayeron por debajo del umbral calibrado (near-misses genuinos,
+0.10-0.14 vs. 0.23) y se reemplazaron por formulaciones más claras en vez de bajar el umbral a mano
+-- documentado en el propio harness, no escondido.
+
+**Cómo agregar o editar contenido** (pensado para alguien NO técnico, editando
+`tests/canonical_answers.yaml` -- o el archivo real que lo reemplace):
+1. Copiar el formato de una entrada existente: `id`, `formulaciones` (3-6 formas de preguntar lo
+   mismo) y `respuestas` (1 o más variantes de texto).
+2. Al arrancar el asistente (o correr `scripts/eval.py`/`scripts/calibrate.py`), si algo está mal
+   (id repetido, campo vacío, formulación que choca con otra entrada) sale un error con el nombre
+   de la entrada -- corregir eso antes de seguir.
+3. El lint (warnings, no bloquean) avisa de cosas que suenan raro en voz alta: números en dígitos,
+   abreviaturas, viñetas/markdown, respuestas muy largas, o variantes de largo muy distinto entre sí
+   dentro de la misma entrada. Conviene revisarlas igual aunque no bloqueen.
+4. **Importante**: si se actualiza un dato (una dirección, un teléfono), hay que cambiarlo en
+   **TODAS** las variantes de respuesta de esa entrada -- son formas distintas de decir lo mismo, no
+   pueden quedar diciendo cosas distintas entre sí.
+5. Después de cambiar contenido (agregar/sacar entradas, reformular preguntas o respuestas), correr
+   `python scripts/calibrate.py` de nuevo -- el umbral (`canonical.threshold`) está calibrado contra
+   el contenido ANTERIOR, y agregar o sacar entradas puede correr los scores de las demás.
+
 ## Estructura
 
 ```
@@ -758,8 +912,9 @@ voice/
   stt.py        faster-whisper (GPU)
   rag.py        chunking + retrieval híbrido (denso + BM25/RRF) + reranker
   rewrite.py    reescritura de consulta + descomposición de preguntas compuestas
+  canonical.py  respuestas canónicas (FAQ, texto fijo) -- matching + rotación de variantes
   llm.py        llama-server (subproceso HTTP), streaming
-  guardrails.py reglas deterministas (abstención, ambigüedad, anti-CJK)
+  guardrails.py reglas deterministas (abstención, ambigüedad, anti-CJK, "repetí")
   tts.py        Piper, streaming por frase
   pipeline.py   orquesta todo (clase Assistant)
   config.py     config.toml + calibration.toml -> dataclasses tipadas
@@ -767,13 +922,15 @@ scripts/
   download_models.py   descarga todos los modelos
   bench.py              benchmark end-to-end sin mic
   eval.py                corre tests/eval_questions.yaml contra el LLM/RAG real
-  calibrate.py           calibra rag.min_score/ambiguity_threshold contra tests/calibration_questions.yaml
+  calibrate.py           calibra rag.min_score/ambiguity_threshold/canonical.threshold
 docs/                     documentos de ejemplo para el RAG (reemplazar por los reales)
 tests/
   eval_questions.yaml         casos de comportamiento (dev/validación) para scripts/eval.py
-  calibration_questions.yaml  set etiquetado para scripts/calibrate.py
+  calibration_questions.yaml  set etiquetado para calibrar rag.min_score/ambiguity_threshold
+  canonical_answers.yaml      FAQ de respuestas canónicas -- contenido de PRUEBA, reemplazar
+  calibration_canonical.yaml  set etiquetado para calibrar canonical.threshold
 config.toml       arquitectura + defaults documentados
-calibration.toml  PROVISORIO, generado por scripts/calibrate.py -- pisa min_score/ambiguity_threshold
+calibration.toml  PROVISORIO, generado por scripts/calibrate.py -- pisa min_score/ambiguity_threshold/canonical.threshold
 ```
 
 ## ¿Se puede acelerar Whisper y Piper?

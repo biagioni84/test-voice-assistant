@@ -85,6 +85,38 @@
     - ["¿Y el trabajo remoto?", "Está permitido dos días por semana."]
   question: "¿y cuántos días dije que eran?"
 
+- id: rewrite_sujeto_elidido_sino
+  type: rewrite
+  note: >
+    patrón general de sujeto elidido preservando el tipo sí/no -- formulación distinta del caso
+    motivador real (oficina/"todos los días", ver README) para no sobreajustar al caso puntual.
+  expect: >
+    algo como "¿El soporte técnico atiende los fines de semana?" -- debe conservar "el soporte
+    técnico" (no perderlo) Y seguir siendo una pregunta de sí/no (no "¿cuándo atiende...?")
+  history:
+    - ["¿El soporte técnico atiende de noche?", "No, solo en horario de oficina."]
+  question: "los fines de semana"
+
+- id: rewrite_afirmacion_como_confirmacion
+  type: rewrite
+  note: >
+    afirmación sin "?" (en voz hablada, una confirmación de sí/no suena como afirmación con
+    entonación) que debe convertirse en pregunta de confirmación, arrastrando el sujeto del
+    historial -- formulación distinta del caso motivador.
+  expect: "algo como '¿El wifi de invitados cambia la contraseña cada semana?'"
+  history:
+    - ["¿Cómo es el wifi de invitados?", "Se llama Invitados-Oficina y la contraseña cambia cada mes."]
+  question: "Cambia la contraseña cada semana."
+
+- id: rewrite_afirmacion_primer_turno
+  type: rewrite
+  note: >
+    afirmación aislada en el PRIMER turno de la charla (sin historial) -- debe convertirse a
+    pregunta igual, aunque no haya sujeto del historial para completarla.
+  expect: "algo como '¿El estacionamiento tiene doce lugares?'"
+  history: []
+  question: "El estacionamiento tiene doce lugares."
+
 - id: rewrite_decompose_no_trunca_json
   type: rewrite
   compound: true
@@ -261,6 +293,17 @@
   turns:
     - "La oficina no abre los domingos, ¿verdad?"
 
+- id: correccion_de_premisa
+  note: >
+    pregunta de sí/no con una premisa incorrecta (el doc dice "Invitados-Oficina", no
+    "Red-Oficina") -- debe corregir la premisa con el dato correcto, no solo confirmar/negar sin
+    explicar ni abstener. NO se ajusta el umbral para este caso puntual (ver README) -- si el
+    retrieval no encuentra el chunk, se documenta como evidencia para BM25/cambio de modelo, no se
+    fuerza bajando min_score.
+  expect: "debe decir que el wifi se llama Invitados-Oficina, no Red-Oficina (corrige, no solo niega)"
+  turns:
+    - "¿El wifi de invitados se llama Red-Oficina?"
+
 - id: pregunta_compuesta
   compound: true
   note: >
@@ -370,3 +413,148 @@
   expect: "debe responder el horario del sábado Y qué hacer si la computadora no enciende"
   turns:
     - "Contame el horario del sábado y de paso decime qué hago si la computadora no enciende."
+
+- id: validation_sujeto_elidido_y_afirmacion
+  split: validation
+  note: >
+    conversación REAL que disparó los bugs 1-3 en una prueba en vivo (23/09, ver README): el
+    reescritor perdía "la oficina" al resolver "todos los días" (cambiando además sí/no por
+    qué/cuándo), no convertía la afirmación final (sin "?") en pregunta, y el re-agregado de "?"
+    corrompía texto que ya terminaba en "." (salía "...mañana.?"). Se agrega tal cual se dio, como
+    holdout -- no se tocaron few-shots calcados de esta conversación puntual (los que se agregaron
+    usan otros temas, ver rewrite_sujeto_elidido_sino/rewrite_afirmacion_como_confirmacion).
+    RESULTADO PARCIAL, documentado a propósito en vez de forzarlo con un few-shot calcado: turnos
+    1-2 preservan "la oficina" y el tipo sí/no de forma confiable (se probó con varios temas
+    distintos: wifi, sala de reuniones, estacionamiento, todos generalizan bien). El turno 3 (una
+    oración YA gramaticalmente completa -- "Y todos los días abre a las 10 de la mañana" -- sin
+    ninguna palabra que remita explícitamente al sujeto) sigue perdiendo "la oficina" en la mayoría
+    de las corridas, un límite real del 3B que se repite con otros temas equivalentes (p.ej. "sala
+    Sur"), no algo puntual de esta conversación. Lo importante: el sistema degrada SEGURO en ese
+    caso (abstiene honestamente "no lo encontré, ¿me lo preguntás de otra forma?"), no alucina ni
+    produce texto corrupto -- eso sí quedó arreglado del todo.
+  expect: >
+    turnos 1 y 2 deben seguir hablando de LA OFICINA preservando sí/no, con corrección de premisa
+    ("no, abre de lunes a viernes" o similar) en vez de una simple confirmación; el turno 3 puede
+    abstener honestamente ("no lo encontré...") si no preservó el sujeto -- NO debe alucinar ni
+    producir texto con puntuación corrupta (tipo "...mañana.?")
+  turns:
+    - "¿Qué hora abre la oficina?"
+    - "todos los días"
+    - "Y todos los días abre a las 10 de la mañana."
+
+# ============================================================================
+# Respuestas canónicas (FAQ, texto fijo) -- ver voice/canonical.py, tests/canonical_answers.yaml y
+# README. Contenido INVENTADO (ver tests/canonical_answers.yaml) -- se prueba el MECANISMO, no el
+# contenido. Todos con expect_canonical_entries/expect_exact_text/etc: chequeos AUTOMÁTICOS (exit
+# code != 0 si fallan), no juicio humano -- ver scripts/eval.py: _check_canonical_expectations.
+# ============================================================================
+
+- id: canonical_match_a_que_se_dedica
+  note: match correcto, formulación nueva (no la del yaml) -- imperativa
+  expect_canonical_entries: ["a_que_se_dedica"]
+  turns:
+    - "Decime a qué se dedica la empresa."
+
+- id: canonical_match_ubicacion
+  note: >
+    match correcto, formulación nueva. ("Che, ¿dónde están ubicados?" -- probada primero -- quedó
+    afuera: puntúa 0.12, apenas debajo del umbral calibrado 0.23 -- un near-miss real y esperable
+    del barrido precisión-primero, no un motivo para bajar el umbral a mano, ver README.)
+  expect_canonical_entries: ["ubicacion"]
+  turns:
+    - "¿En qué dirección están?"
+
+- id: canonical_match_contacto
+  note: match correcto, formulación nueva -- imperativa
+  expect_canonical_entries: ["contacto"]
+  turns:
+    - "Decime el mail de contacto."
+
+- id: canonical_match_historia
+  note: >
+    match correcto, formulación nueva. ("¿Hace mucho que la empresa está funcionando?" -- probada
+    primero -- quedó afuera: matchea la entrada equivocada (a_que_se_dedica) con score bajo, un
+    near-miss real del barrido precisión-primero, ver README.)
+  expect_canonical_entries: ["historia"]
+  turns:
+    - "¿Cuántos años lleva la empresa en el mercado?"
+
+- id: canonical_match_horario_atencion
+  note: match correcto, formulación nueva -- se solapa en TEMA con docs/oficina.md a propósito
+  expect_canonical_entries: ["horario_atencion_publico"]
+  turns:
+    - "¿A qué hora puedo ir a la oficina a hacer un trámite?"
+
+- id: canonical_match_como_followup
+  note: match correcto llegando como FOLLOW-UP (segundo turno), después de una pregunta sin relación resuelta por RAG
+  expect_canonical_entries: [null, "a_que_se_dedica"]
+  turns:
+    - "¿Qué hora abre la oficina los sábados?"
+    - "Y aparte, ¿a qué se dedica la empresa?"
+
+- id: canonical_falso_positivo_persona
+  note: >
+    FALSO POSITIVO que NO debe matchear -- "a_que_se_dedica" es sobre la EMPRESA, no una persona.
+    El caso más importante de los tres: un falso positivo acá recita con total confianza un texto
+    que no corresponde.
+  expect_canonical_entries: [null]
+  turns:
+    - "¿A qué se dedica Juan?"
+
+- id: canonical_falso_positivo_area
+  note: FALSO POSITIVO que NO debe matchear -- pregunta sobre un ÁREA puntual, no la empresa entera
+  expect_canonical_entries: [null]
+  turns:
+    - "¿A qué se dedica el área de testing?"
+
+- id: canonical_falso_positivo_bano
+  note: FALSO POSITIVO que NO debe matchear -- "ubicacion" es sobre la dirección de la empresa, no el baño
+  expect_canonical_entries: [null]
+  turns:
+    - "¿Dónde queda el baño?"
+
+- id: canonical_fuera_de_dominio_sigue_abstenido
+  note: pregunta fuera de dominio -- no debe matchear canonical NI encontrar nada en el RAG, sigue abstenido
+  expect_canonical_entries: [null]
+  expect: "debe abstener (no tiene información), no debe inventar ni matchear ninguna canónica"
+  turns:
+    - "¿Cuál es la capital de Francia?"
+
+- id: canonical_compuesta_mixta
+  compound: true
+  note: >
+    pregunta compuesta con una parte canónica y otra que va al RAG -- la parte canónica debe
+    responderse textual (sin pasar por el LLM), la otra por RAG, concatenadas.
+  expect_canonical_entries: ["a_que_se_dedica"]
+  expect: "debe responder ambas partes: a qué se dedica la empresa (texto canónico textual) Y el horario de sábados (del RAG)"
+  turns:
+    - "¿A qué se dedica la empresa y a qué hora abre la oficina los sábados?"
+
+- id: canonical_texto_exacto
+  note: el texto de la respuesta debe ser EXACTAMENTE la variante 1 de tests/canonical_answers.yaml, carácter por carácter
+  expect_canonical_entries: ["a_que_se_dedica"]
+  expect_exact_text: "Somos una empresa de tecnología, especializada en desarrollar software a medida para otras empresas."
+  turns:
+    - "¿A qué se dedica la empresa?"
+
+- id: canonical_rotacion_variantes
+  note: >
+    misma pregunta repetida en la misma conversación -- debe rotar por las 3 variantes de
+    respuesta en orden (1→2→3), y al agotarse volver a empezar por la 1.
+  expect_canonical_entries: ["a_que_se_dedica", "a_que_se_dedica", "a_que_se_dedica", "a_que_se_dedica"]
+  expect_variant_rotation: 3
+  turns:
+    - "¿A qué se dedica la empresa?"
+    - "¿A qué se dedica la empresa?"
+    - "¿A qué se dedica la empresa?"
+    - "¿A qué se dedica la empresa?"
+
+- id: canonical_repetí_no_rota
+  note: >
+    "repetí" después de una respuesta canónica debe repetir la MISMA variante tal cual, sin avanzar
+    la rotación (a diferencia de volver a preguntar lo mismo, que sí rota).
+  expect_canonical_entries: ["a_que_se_dedica", null]
+  expect_repeat_of_previous: true
+  turns:
+    - "¿A qué se dedica la empresa?"
+    - "¿cómo?"

@@ -1,9 +1,13 @@
 # Generado por scripts/calibrate.py -- NO editar a mano, volver a correr el script.
-# Calibrado contra tests/calibration_questions.yaml (16 preguntas etiquetadas).
-# Si cambian los documentos de docs/ o el dataset de calibración:
+# Calibrado contra tests/calibration_questions.yaml (16 preguntas etiquetadas) y tests/calibration_canonical.yaml.
+# Si cambian los documentos de docs/, el contenido de canonical_answers.yaml, o los
+# datasets de calibración:
 #   python scripts/calibrate.py
 # Ver README: parámetros calibrados (acá) vs. arquitectura estable (config.toml/código).
 
 [rag]
 min_score = -0.682552
 ambiguity_threshold = 0.500100
+
+[canonical]
+threshold = 0.231240

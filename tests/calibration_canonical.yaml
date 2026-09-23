@@ -1,0 +1,81 @@
+# Set etiquetado para calibrar canonical.threshold (scripts/calibrate.py) -- ver
+# tests/canonical_answers.yaml y voice/canonical.py. NO es para verificar comportamiento del
+# mecanismo (eso son los casos "canonical_*" de tests/eval_questions.yaml), es para ELEGIR
+# canonical.threshold de forma principista en vez de a mano.
+#
+# Atado al contenido de tests/canonical_answers.yaml (inventado, de prueba) -- cuando exista el
+# contenido real de la empresa, este archivo se reescribe entero con preguntas sobre ESE contenido,
+# y se corre `python scripts/calibrate.py` de nuevo.
+#
+# label:
+#   match:    la pregunta SÍ debería matchear la entrada canónica 'entry_id' (responder texto fijo)
+#   no_match: la pregunta NO debería matchear ninguna entrada canónica -- sigue al RAG/abstención.
+#             'entry_id' no aplica acá.
+#
+# Precisión > recall a propósito (ver README): si una canónica no matchea, cae al RAG (se pierde
+# una respuesta más controlada, pero no se rompe nada); si matchea MAL, se recita con total
+# confianza un texto que no corresponde -- ese es el error caro.
+
+- question: "¿A qué se dedica la empresa?"
+  label: match
+  entry_id: a_que_se_dedica
+- question: "¿En qué rubro están?"
+  label: match
+  entry_id: a_que_se_dedica
+- question: "¿A qué se dedica esta empresa exactamente?"
+  label: match
+  entry_id: a_que_se_dedica
+
+- question: "¿Dónde queda la oficina?"
+  label: match
+  entry_id: ubicacion
+- question: "¿Cuál es la dirección de la empresa?"
+  label: match
+  entry_id: ubicacion
+- question: "¿En qué parte de la ciudad están ubicados?"
+  label: match
+  entry_id: ubicacion
+
+- question: "¿Cómo puedo comunicarme con la empresa?"
+  label: match
+  entry_id: contacto
+- question: "Decime el teléfono de contacto."
+  label: match
+  entry_id: contacto
+- question: "¿A qué mail les puedo escribir?"
+  label: match
+  entry_id: contacto
+
+- question: "¿Cuándo se fundó la empresa?"
+  label: match
+  entry_id: historia
+- question: "¿Hace cuánto que están en el mercado?"
+  label: match
+  entry_id: historia
+- question: "¿Cuál es la antigüedad de la empresa?"
+  label: match
+  entry_id: historia
+
+- question: "¿A qué hora atienden al público?"
+  label: match
+  entry_id: horario_atencion_publico
+- question: "¿Puedo pasar por la oficina a hacer un trámite a la tarde?"
+  label: match
+  entry_id: horario_atencion_publico
+
+- question: "¿A qué se dedica Juan?"
+  label: no_match
+- question: "¿A qué se dedica el área de testing?"
+  label: no_match
+- question: "¿Dónde queda el baño?"
+  label: no_match
+- question: "¿Qué hora abre la oficina los sábados?"
+  label: no_match
+- question: "¿Cómo puedo restablecer la contraseña del correo?"
+  label: no_match
+- question: "¿Cuántos días de vacaciones tengo?"
+  label: no_match
+- question: "Contame un chiste."
+  label: no_match
+- question: "¿Qué hora es en Tokio ahora mismo?"
+  label: no_match

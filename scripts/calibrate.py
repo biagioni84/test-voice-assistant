@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import voice  # noqa: F401,E402  (importa llama_cpp primero, ver voice/__init__.py)
+from voice.canonical import CanonicalMatcher  # noqa: E402
 from voice.config import load_config  # noqa: E402
 from voice.rag import Hit, Retriever  # noqa: E402
 
@@ -163,9 +164,58 @@ def recall_at_n(retriever: Retriever, questions: list[dict], n: int) -> list[dic
     return rows
 
 
+def sweep_canonical_threshold(rows: list[dict]) -> list[dict]:
+    """rows: [{"label": "match"|"no_match", "expected_entry": str|None, "best_entry": str|None,
+    "best_score": float|None}, ...]. Barre umbrales candidatos (todos los scores observados) y
+    cuenta, por cada uno, cuántos "match" se resuelven bien (matchea Y es la entrada correcta) vs.
+    cuántos casos PELIGROSOS produce: una pregunta 'no_match' que termina matcheando algo (recita
+    texto que no correspondía a nada), o una 'match' que matchea la entrada EQUIVOCADA (recita el
+    texto de otra entrada, con total confianza) -- ver pick_best_canonical_threshold, que prioriza
+    cero casos peligrosos por sobre recall."""
+    scores = sorted({r["best_score"] for r in rows if r["best_score"] is not None}, reverse=True)
+    if not scores:
+        return []
+    candidates = scores + [scores[-1] - 1.0]
+    out = []
+    for thr in candidates:
+        tp = fp_wrong_entry = fp_no_match = fn = tn = 0
+        for r in rows:
+            predicted = r["best_score"] is not None and r["best_score"] >= thr
+            if r["label"] == "match":
+                if predicted and r["best_entry"] == r["expected_entry"]:
+                    tp += 1
+                elif predicted:
+                    fp_wrong_entry += 1
+                else:
+                    fn += 1
+            else:
+                if predicted:
+                    fp_no_match += 1
+                else:
+                    tn += 1
+        out.append({
+            "threshold": thr, "tp": tp, "fn": fn, "tn": tn,
+            "fp_wrong_entry": fp_wrong_entry, "fp_no_match": fp_no_match,
+            "dangerous": fp_wrong_entry + fp_no_match,
+        })
+    return out
+
+
+def pick_best_canonical_threshold(rows: list[dict]) -> float:
+    """Precisión primero (ver README: si una canónica no matchea cae al RAG, sin drama; si matchea
+    MAL, recita con confianza un texto equivocado -- ese es el error caro). Entre los umbrales con
+    CERO casos peligrosos, el que maximiza cuántos 'match' se resuelven bien; empate a favor de más
+    estricto. Si ninguno logra cero peligrosos, el de menos peligrosos (y entre esos, más estricto)."""
+    safe = [r for r in rows if r["dangerous"] == 0]
+    if safe:
+        return max(safe, key=lambda r: (r["tp"], r["threshold"]))["threshold"]
+    return min(rows, key=lambda r: (r["dangerous"], -r["threshold"]))["threshold"]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default="tests/calibration_questions.yaml")
+    ap.add_argument("--canonical-questions", default="tests/calibration_canonical.yaml")
     ap.add_argument("--out", default="calibration.toml")
     ap.add_argument("--recall-n", type=int, default=5, help="tamaño del top-n denso para el reporte de recall@n")
     ap.add_argument("--dry-run", action="store_true", help="solo mostrar el reporte, no escribir el archivo")
@@ -178,9 +228,11 @@ def main() -> None:
     # fallback para cuando no hay suficientes datos para recalibrar algo: el default de
     # config.toml, NO cfg.rag (que ya trae calibration.toml de una corrida anterior superpuesto --
     # usar cfg.rag ahí perpetuaría un valor viejo/stale en vez de caer al default documentado).
-    _raw_defaults = tomllib.loads((ROOT / "config.toml").read_text(encoding="utf-8")).get("rag", {})
+    _raw_config = tomllib.loads((ROOT / "config.toml").read_text(encoding="utf-8"))
+    _raw_defaults = _raw_config.get("rag", {})
     fallback_min_score = _raw_defaults.get("min_score", cfg.rag.min_score)
     fallback_ambiguity = _raw_defaults.get("ambiguity_threshold", cfg.rag.ambiguity_threshold)
+    fallback_canonical_threshold = _raw_config.get("canonical", {}).get("threshold", cfg.canonical.threshold)
 
     questions = yaml.safe_load((ROOT / args.questions).read_text(encoding="utf-8"))
 
@@ -287,6 +339,54 @@ def main() -> None:
             f"umbrales con FPR=0 sobre in_domain, si hay alguno; si no, el de mayor recall a secas)"
         )
 
+    # ---- canonical.threshold ---------------------------------------------------------------
+    chosen_canonical_threshold = fallback_canonical_threshold
+    canonical_path = ROOT / args.canonical_questions
+    if cfg.canonical.enabled and canonical_path.exists():
+        print(f"\n## Calibración de canonical.threshold — {args.canonical_questions}\n")
+        print("Cargando CanonicalMatcher (reranker sobre tests/canonical_answers.yaml)…", flush=True)
+        matcher = CanonicalMatcher(cfg.canonical)
+        canonical_questions = yaml.safe_load(canonical_path.read_text(encoding="utf-8")) or []
+
+        canon_rows = []
+        for q in canonical_questions:
+            best = matcher.best_score(q["question"])  # no muta rotación, ver voice/canonical.py
+            canon_rows.append({
+                "question": q["question"],
+                "label": q["label"],
+                "expected_entry": q.get("entry_id"),
+                "best_entry": best[0] if best else None,
+                "best_score": best[1] if best else None,
+            })
+
+        print(f"{'pregunta':<50} {'label':<10} {'esperado':<22} {'mejor match':<22} {'score':>7}")
+        for r in canon_rows:
+            best_s = f"{r['best_score']:.2f}" if r["best_score"] is not None else "—"
+            print(
+                f"{r['question'][:48]:<50} {r['label']:<10} {str(r['expected_entry'] or '—'):<22} "
+                f"{str(r['best_entry'] or '—'):<22} {best_s:>7}"
+            )
+
+        canon_sweep_rows = sweep_canonical_threshold(canon_rows)
+        if not canon_sweep_rows:
+            print("(sin scores para barrer -- ¿tests/canonical_answers.yaml está vacío?)")
+        else:
+            print(f"\n{'umbral':>8} {'TP':>4} {'FN':>4} {'TN':>4} {'FP entrada mala':>16} {'FP no_match':>12} {'peligrosos':>10}")
+            for r in canon_sweep_rows:
+                print(
+                    f"{r['threshold']:>8.2f} {r['tp']:>4} {r['fn']:>4} {r['tn']:>4} "
+                    f"{r['fp_wrong_entry']:>16} {r['fp_no_match']:>12} {r['dangerous']:>10}"
+                )
+            chosen_canonical_threshold = pick_best_canonical_threshold(canon_sweep_rows)
+            print(
+                f"\n-> elegido: canonical.threshold = {chosen_canonical_threshold:.3f} (cero casos "
+                f"peligrosos -- ni matchear la entrada equivocada ni matchear algo que no debía "
+                f"matchear nada -- y entre esos, el que resuelve más 'match' bien; empate a favor "
+                f"de más estricto)"
+            )
+    elif cfg.canonical.enabled:
+        print(f"\n(canonical.enabled pero no existe {args.canonical_questions} -- no se calibra canonical.threshold)")
+
     if args.dry_run:
         print("\n(--dry-run: no se escribió calibration.toml)")
         return
@@ -300,20 +400,30 @@ def main() -> None:
     EPS = 1e-4
     safe_min_score = chosen_min_score - EPS
     safe_ambiguity = chosen_ambiguity + EPS
+    # mismo sentido de comparación que min_score (score >= umbral) -- restar EPS lo deja del lado
+    # inclusivo del candidato que lo generó.
+    safe_canonical_threshold = chosen_canonical_threshold - EPS
 
     out_path = ROOT / args.out
     out_path.write_text(
         "# Generado por scripts/calibrate.py -- NO editar a mano, volver a correr el script.\n"
-        f"# Calibrado contra {args.questions} ({len(questions)} preguntas etiquetadas).\n"
-        "# Si cambian los documentos de docs/ o el dataset de calibración:\n"
+        f"# Calibrado contra {args.questions} ({len(questions)} preguntas etiquetadas) y "
+        f"{args.canonical_questions}.\n"
+        "# Si cambian los documentos de docs/, el contenido de canonical_answers.yaml, o los\n"
+        "# datasets de calibración:\n"
         "#   python scripts/calibrate.py\n"
         "# Ver README: parámetros calibrados (acá) vs. arquitectura estable (config.toml/código).\n"
         "\n[rag]\n"
         f"min_score = {safe_min_score:.6f}\n"
-        f"ambiguity_threshold = {safe_ambiguity:.6f}\n",
+        f"ambiguity_threshold = {safe_ambiguity:.6f}\n"
+        "\n[canonical]\n"
+        f"threshold = {safe_canonical_threshold:.6f}\n",
         encoding="utf-8",
     )
-    print(f"\nEscrito {out_path} (min_score={safe_min_score:.6f}, ambiguity_threshold={safe_ambiguity:.6f}, con margen de {EPS} contra pérdida de precisión)")
+    print(
+        f"\nEscrito {out_path} (min_score={safe_min_score:.6f}, ambiguity_threshold={safe_ambiguity:.6f}, "
+        f"canonical.threshold={safe_canonical_threshold:.6f}, con margen de {EPS} contra pérdida de precisión)"
+    )
 
 
 if __name__ == "__main__":

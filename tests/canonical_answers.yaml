@@ -1,0 +1,94 @@
+# FAQ de respuestas canónicas (texto fijo, redactado por la empresa) -- se responde textual, SIN
+# pasar por el LLM, para preguntas frecuentes donde importa el control exacto del mensaje. Convive
+# con el RAG: si una (sub)pregunta matchea una entrada de acá, se responde con su texto; si no,
+# sigue el pipeline normal (RAG -> LLM). Ver voice/canonical.py y README.
+#
+# CONTENIDO INVENTADO -- estas 5 entradas son de ejemplo, para dejar lista la infraestructura del
+# mecanismo (matching, rotación de variantes, lint, calibración). Cuando exista contenido real de
+# la empresa, este archivo se reescribe entero (mismo formato) y se corre
+# `python scripts/calibrate.py` de nuevo para recalibrar canonical.threshold contra el contenido
+# real -- ver tests/calibration_canonical.yaml.
+#
+# Formato por entrada:
+#   id:            nombre corto, único, sin espacios
+#   formulaciones: 3-6 formas distintas de preguntar lo mismo (se usan para el matching por
+#                  reranker contra la pregunta del usuario)
+#   respuestas:    1 o más variantes de texto de respuesta (todas deben decir lo mismo -- si se
+#                  actualiza un dato, hay que cambiarlo en TODAS las variantes de la entrada). Se
+#                  usa una sola variante por vez, rotando en orden dentro de la misma conversación
+#                  (ver voice/canonical.py: CanonicalState) -- conversación nueva siempre empieza
+#                  por la primera.
+#
+# Validado al cargar (rechaza el archivo con un error claro si falla):
+#   - ids únicos
+#   - ningún campo vacío (ni la lista, ni un string suelto adentro)
+#   - ninguna formulación duplicada ENTRE entradas distintas (una misma frase no puede matchear dos
+#     entradas a la vez)
+#
+# Lint al cargar (warnings, no bloquean la carga) sobre cada variante de respuesta -- pensado para
+# texto que lee Piper en voz alta:
+#   - dígitos o formatos tipo "9-13hs" (los números deben escribirse como se pronuncian)
+#   - abreviaturas comunes ("Av.", "Sr.", "etc.", "N°")
+#   - viñetas o markdown ("- ", "**negrita**")
+#   - más de ~80 palabras
+#   - variantes de una misma entrada con largos muy distintos entre sí (probablemente no dicen lo
+#     mismo -- revisar)
+
+- id: a_que_se_dedica
+  formulaciones:
+    - "¿A qué se dedica la empresa?"
+    - "¿Qué hace la empresa?"
+    - "¿Cuál es el rubro de la empresa?"
+    - "¿A qué se dedican ustedes?"
+    - "Contame a qué se dedican."
+    - "¿Qué tipo de empresa son?"
+  respuestas:
+    - "Somos una empresa de tecnología, especializada en desarrollar software a medida para otras empresas."
+    - "Nos dedicamos al desarrollo de software a medida para empresas, con foco en soluciones de tecnología."
+    - "Desarrollamos software a medida para otras empresas, ese es nuestro negocio principal."
+
+- id: ubicacion
+  formulaciones:
+    - "¿Dónde quedan?"
+    - "¿Dónde está la oficina?"
+    - "¿Cuál es la dirección?"
+    - "¿Dónde los encuentro?"
+    - "¿En qué ciudad están?"
+  respuestas:
+    - "Estamos en avenida Siempre Viva, setecientos cuarenta y dos, en Buenos Aires."
+    - "Nuestra oficina queda en avenida Siempre Viva, setecientos cuarenta y dos, en la ciudad de Buenos Aires."
+
+- id: contacto
+  formulaciones:
+    - "¿Cómo los contacto?"
+    - "¿Cuál es el teléfono?"
+    - "¿Tienen un correo de contacto?"
+    - "¿Cómo me comunico con ustedes?"
+    - "Decime cómo puedo contactarlos."
+  respuestas:
+    - "Podés escribirnos a contacto arroba empresa punto com, o llamarnos al cero once, cuatro cinco seis siete, ocho nueve cero uno."
+    - "Nuestro correo de contacto es contacto arroba empresa punto com, y también podés llamarnos por teléfono."
+
+- id: historia
+  formulaciones:
+    - "¿Cuándo se fundó la empresa?"
+    - "¿Hace cuánto que existen?"
+    - "Contame la historia de la empresa."
+    - "¿Desde cuándo están en el mercado?"
+    - "¿Cuántos años tiene la empresa?"
+  respuestas:
+    - "La empresa se fundó hace más de quince años, y desde entonces trabaja en soluciones de tecnología para otras empresas."
+    - "Estamos en el mercado desde hace más de quince años, ofreciendo soluciones de tecnología a otras empresas."
+
+- id: horario_atencion_publico
+  # a propósito se solapa en TEMA con docs/oficina.md (que tiene el horario general de la oficina)
+  # -- sirve para probar que la canónica gana prioridad cuando matchea, en vez de dejar que el RAG
+  # responda con el chunk del documento.
+  formulaciones:
+    - "¿Cuál es el horario de atención al público?"
+    - "¿A qué hora atienden al público?"
+    - "¿Cuándo puedo pasar por la oficina a hacer un trámite?"
+    - "¿En qué horario recibe visitas la empresa?"
+  respuestas:
+    - "Atendemos al público de lunes a viernes, de nueve a dieciocho horas."
+    - "El horario de atención al público es de lunes a viernes, de nueve a dieciocho."

@@ -33,6 +33,8 @@ from voice.pipeline import Assistant  # noqa: E402
 
 rewrite_latencies_ms: list[float] = []  # se llena en run_case(), se reporta al final
 subq_check_failures: list[str] = []  # casos con expect_n_subquestions que no dieron ese número
+history_check_failures: list[str] = []  # turnos donde self.llm.history no creció (record_turn no se llamó)
+canonical_check_failures: list[str] = []  # casos con expect_canonical_*/expect_exact_text/etc que no dieron lo esperado
 
 
 def case_variants(case: dict) -> list[tuple[str | None, list[str]]]:
@@ -98,8 +100,23 @@ def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], sh
         if case.get("expect"):
             lines.append(f"> **se espera:** {case['expect'].strip()}")
     lines.append("")
+    turn_results: list = []
     for q in turns:
+        # chequeo AUTOMÁTICO (no juicio humano): la pregunta del usuario tiene que guardarse en el
+        # historial SIEMPRE, incluso en turnos que terminan en abstención/nota fija -- ver
+        # voice/pipeline.py: Assistant._fixed_reply/answer, ambos llaman a record_turn(). Regresión
+        # real encontrada en vivo (23/09, ver README): un turno se procesó "sin historial" sin que
+        # nada lo hubiera reiniciado a propósito -- terminó siendo un timeout de followup_s
+        # silencioso (arreglado aparte, ver Assistant.run), pero este chequeo queda como red de
+        # seguridad genuina contra que record_turn deje de llamarse en algún camino nuevo.
+        hist_before = len(bot.llm.history)
         turn = bot.answer(q)
+        hist_after = len(bot.llm.history)
+        if hist_after != hist_before + 2:
+            history_check_failures.append(
+                f"{case['id']}: tras {q!r}, self.llm.history pasó de {hist_before} a {hist_after} "
+                f"elementos (se esperaban +2 -- record_turn no se llamó o llamó de más)"
+            )
         if turn.t_rewrite:
             rewrite_latencies_ms.append(turn.t_rewrite * 1000)
         lines.append(f"- 🗣 **{q}**")
@@ -116,8 +133,80 @@ def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], sh
         else:
             hits = ", ".join(f"{h.source}@{h.score:.2f}" for h in turn.context_hits)
             lines.append(f"  - RAG: {hits}")
+        # distingue "no se recuperó nada" de "se recuperó con score bajo" (ver voice/pipeline.py:
+        # Turn.retrieval_trace) -- solo se muestra cuando NO hubo hits, para no duplicar la línea
+        # de arriba en el caso normal
+        for tr in turn.retrieval_trace:
+            if not tr["had_hits"]:
+                top1 = f"{tr['top1_source']}@{tr['top1_score']:.2f}" if tr["top1_source"] else "ningún candidato"
+                lines.append(f"  - 🔎 {tr['subq']!r}: top1={top1} (min_score={tr['min_score']:.2f})")
+        for cm in turn.canonical_matches:
+            lines.append(f"  - 📌 canonical:{cm['entry_id']}@{cm['score']:.2f}")
+        turn_results.append(turn)
+    lines += _check_canonical_expectations(case, turn_results)
     lines.append("")
     return lines
+
+
+def _check_canonical_expectations(case: dict, turn_results: list) -> list[str]:
+    """Chequeos AUTOMÁTICOS (no juicio humano) sobre la capa de respuestas canónicas
+    (voice/canonical.py) -- ver README. Campos opcionales del caso:
+      expect_canonical_entries: list[str|None], un elemento por turno -- el entry_id que debería
+        haber matcheado ESE turno (None = no debería matchear ninguna entrada canónica).
+      expect_exact_text: el último turno debe responder con ESTE texto, carácter por carácter.
+      expect_variant_rotation: N -- los primeros N turnos deben dar N textos DISTINTOS entre sí, y
+        el turno N+1 (si existe) debe repetir el texto del primer turno (rotación completa).
+      expect_repeat_of_previous: true -- el último turno debe repetir EXACTO el texto del anterior
+        (was_repeat=True), sin rotar variantes.
+    Cualquier fallo se junta en canonical_check_failures y termina el proceso con exit code != 0
+    (ver main())."""
+    out: list[str] = []
+    cid = case["id"]
+
+    expect_entries = case.get("expect_canonical_entries")
+    if expect_entries is not None:
+        for i, (expected, turn) in enumerate(zip(expect_entries, turn_results)):
+            got_ids = [m["entry_id"] for m in turn.canonical_matches]
+            # expected=None: no debería matchear NADA. expected=str: alcanza con que esa entrada
+            # esté ENTRE los matches del turno (no necesariamente la única -- un turno compuesto
+            # mixto puede matchear una sub-pregunta como canonical y resolver la otra por RAG).
+            ok = (not got_ids) if expected is None else (expected in got_ids)
+            got_repr = got_ids if got_ids else None
+            out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: turno {i + 1} esperaba canonical={expected!r}, obtuvo {got_repr!r}")
+            if not ok:
+                canonical_check_failures.append(f"{cid}: turno {i + 1} esperaba canonical={expected!r}, obtuvo {got_repr!r}")
+
+    expect_text = case.get("expect_exact_text")
+    if expect_text is not None:
+        got = turn_results[-1].answer
+        ok = got == expect_text
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_exact_text ({'coincide' if ok else f'obtuvo {got!r}'})")
+        if not ok:
+            canonical_check_failures.append(f"{cid}: expect_exact_text no coincide -- esperaba {expect_text!r}, obtuvo {got!r}")
+
+    n = case.get("expect_variant_rotation")
+    if n is not None:
+        texts = [t.answer for t in turn_results[:n]]
+        distinct_ok = len(set(texts)) == n
+        out.append(f"  - {'✓' if distinct_ok else '✗ FALLÓ'}: primeros {n} turnos dan {len(set(texts))} textos distintos (se esperaban {n})")
+        if not distinct_ok:
+            canonical_check_failures.append(f"{cid}: rotación -- primeros {n} turnos no dan {n} textos distintos: {texts!r}")
+        if len(turn_results) > n:
+            wrap_ok = turn_results[n].answer == turn_results[0].answer
+            out.append(f"  - {'✓' if wrap_ok else '✗ FALLÓ'}: turno {n + 1} repite la variante del turno 1 (rotación completa)")
+            if not wrap_ok:
+                canonical_check_failures.append(f"{cid}: rotación -- turno {n + 1} ({turn_results[n].answer!r}) no repite el turno 1 ({turn_results[0].answer!r})")
+
+    if case.get("expect_repeat_of_previous"):
+        last, prev = turn_results[-1], turn_results[-2]
+        ok = last.answer == prev.answer and last.was_repeat
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: último turno repite el anterior tal cual (was_repeat={last.was_repeat})")
+        if not ok:
+            canonical_check_failures.append(
+                f"{cid}: expect_repeat_of_previous falló -- anterior={prev.answer!r} último={last.answer!r} was_repeat={last.was_repeat}"
+            )
+
+    return out
 
 
 def main() -> None:
@@ -214,13 +303,23 @@ def main() -> None:
     print(text)
     print(f"\n(guardado en {out_path})")
 
-    # únicos chequeos AUTOMÁTICOS de todo el harness (el resto lo juzga un humano/Claude leyendo el
-    # markdown) -- invariantes estructurales puntuales (expect_n_subquestions) donde un número
-    # exacto SÍ tiene una respuesta correcta objetiva, a diferencia de "¿la respuesta está bien?".
-    if subq_check_failures:
-        print(f"\n❌ {len(subq_check_failures)} chequeo(s) de expect_n_subquestions fallaron:")
-        for f in subq_check_failures:
-            print(f"   - {f}")
+    # chequeos AUTOMÁTICOS del harness (el resto lo juzga un humano/Claude leyendo el markdown) --
+    # invariantes estructurales donde SÍ hay una respuesta correcta objetiva, a diferencia de
+    # "¿la respuesta está bien?".
+    all_failures = subq_check_failures + history_check_failures + canonical_check_failures
+    if all_failures:
+        if subq_check_failures:
+            print(f"\n❌ {len(subq_check_failures)} chequeo(s) de expect_n_subquestions fallaron:")
+            for f in subq_check_failures:
+                print(f"   - {f}")
+        if history_check_failures:
+            print(f"\n❌ {len(history_check_failures)} chequeo(s) de persistencia de historial fallaron:")
+            for f in history_check_failures:
+                print(f"   - {f}")
+        if canonical_check_failures:
+            print(f"\n❌ {len(canonical_check_failures)} chequeo(s) de respuestas canónicas fallaron:")
+            for f in canonical_check_failures:
+                print(f"   - {f}")
         sys.exit(1)
 
 

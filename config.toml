@@ -110,10 +110,25 @@ completo y respondé como asistente general, sin forzarlo ni mencionarlo."""
 [rewrite]
 # Reescribe la pregunta de seguimiento en una autónoma ANTES del retrieval (reemplaza al viejo
 # fallback de "sticky hits"). Ver voice/rewrite.py y README. Usa el mismo LLM (Qwen2.5-3B), una
-# llamada extra por turno -- solo si hay historial; el primer turno de la charla no la paga.
+# llamada extra por turno -- se paga sin historial también si la entrada es compuesta
+# (looks_compound) o tiene pinta de afirmación sin forma de pregunta (looks_like_statement); una
+# pregunta simple bien formada en el primer turno sigue sin pagarla.
 enabled = true
 history_turns = 2          # últimos N turnos (usuario+asistente) que ve el reescritor
 max_tokens = 40             # una pregunta reescrita es corta; esto es tope, no objetivo
+
+[canonical]
+# Respuestas canónicas (FAQ con texto fijo, redactado por la empresa) -- ver voice/canonical.py y
+# README. Se evalúan ANTES del RAG, por (sub)pregunta: si el reranker matchea alguna formulación
+# por encima de threshold, se responde con el texto tal cual, sin llamar al LLM.
+enabled = true
+path = "tests/canonical_answers.yaml"   # PROVISORIO -- contenido inventado, reemplazar cuando
+                                         # exista el contenido real de la empresa (mismo formato)
+reranker_model = "jinaai/jina-reranker-v2-base-multilingual"  # mismo modelo que rag.reranker_model
+# PROVISORIO, atado al contenido de path de arriba -- ver README "parámetros calibrados vs.
+# arquitectura estable". Como con rag.min_score/ambiguity_threshold, es solo el FALLBACK: si existe
+# calibration.toml (generado por `python scripts/calibrate.py`) lo pisa.
+threshold = 2.0
 
 [tts]
 voice = "es_AR-daniela-high"

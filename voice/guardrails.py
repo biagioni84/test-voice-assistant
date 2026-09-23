@@ -25,10 +25,29 @@ _CHITCHAT_RE = re.compile("|".join(_CHITCHAT_PATTERNS), re.IGNORECASE)
 
 _PERSON_RE = re.compile(r"\bqui[eé]n\s+es\b", re.IGNORECASE)
 
+# "repetí" / "¿cómo?" / "no te escuché": pide que se repita LA ÚLTIMA respuesta dada (canónica o
+# no) tal cual -- sin rotar variantes canónicas ni volver a generar con el LLM. Ver
+# voice/pipeline.py: Assistant.answer (chequeo determinista, corta antes que nada más).
+_REPEAT_PATTERNS = [
+    r"\brepet[ií](\s|$)", r"\bpod[eé]s\s+repetir\b", r"\botra\s+vez\b",
+    r"^[¿\s]*c[oó]mo\??[\s!]*$",          # "¿cómo?" solo, no "¿cómo es el wifi?"
+    r"\bno\s+te\s+escuch[eé]\b", r"\bno\s+escuch[eé]\b", r"\bno\s+entend[ií]\b",
+    r"\bqu[eé]\s+dijiste\b", r"\bperd[oó]n,?\s+qu[eé]\??\s*$",
+]
+_REPEAT_RE = re.compile("|".join(_REPEAT_PATTERNS), re.IGNORECASE)
+
 
 def is_chitchat(question: str) -> bool:
     """Charla social o sobre el propio asistente: se deja pasar al LLM aunque no haya CONTEXTO."""
     return bool(_CHITCHAT_RE.search(question))
+
+
+def is_repeat_request(question: str) -> bool:
+    """"Repetí", "¿cómo?", "no te escuché" -- pide repetir la última respuesta, no una pregunta
+    nueva. Sesgado a patrones cortos y específicos (a diferencia de is_chitchat) porque el costo de
+    un falso positivo acá es más alto: interceptar una pregunta real como si fuera un pedido de
+    repetición estaría mal, no solo caro en latencia."""
+    return bool(_REPEAT_RE.search(question.strip()))
 
 
 def abstain_reply(question: str, has_history: bool = False) -> str:
