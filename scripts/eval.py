@@ -32,6 +32,7 @@ from voice.config import load_config  # noqa: E402
 from voice.pipeline import Assistant  # noqa: E402
 
 rewrite_latencies_ms: list[float] = []  # se llena en run_case(), se reporta al final
+subq_check_failures: list[str] = []  # casos con expect_n_subquestions que no dieron ese número
 
 
 def case_variants(case: dict) -> list[tuple[str | None, list[str]]]:
@@ -67,6 +68,17 @@ def run_rewrite_case(bot: Assistant, case: dict) -> list[str]:
         lines.append(f"- 🗣 {u}")
         lines.append(f"  - 🤖 {a}")
     lines.append(f"- 🗣 **{case['question']}**")
+    expect_n = case.get("expect_n_subquestions")
+    if expect_n is not None:
+        # chequeo AUTOMÁTICO (no juicio humano) -- pensado para casos que fijan un invariante
+        # estructural puntual, como "el modo descomposición no debe truncarse" (ver
+        # voice/llm.py: _decompose() NO debe recibir stop=["?", ...], si no el JSON de varias
+        # sub-preguntas se corta en el primer "?" y esto cae a 1 sub-pregunta o menos).
+        ok = len(subqs) == expect_n
+        mark = "✓" if ok else "✗ FALLÓ"
+        lines.append(f"  - {mark}: se esperaban {expect_n} sub-preguntas, se obtuvieron {len(subqs)}")
+        if not ok:
+            subq_check_failures.append(f"{case['id']}: esperaba {expect_n}, obtuvo {len(subqs)} -> {subqs!r}")
     if len(subqs) > 1:
         sub_txt = " | ".join(subqs)
         lines.append(f"  - ➜ descompuesta en {len(subqs)}: **{sub_txt}** (se_reescribió={was_rewritten}, {dt_ms:.0f}ms)")
@@ -201,6 +213,15 @@ def main() -> None:
     out_path.write_text(text, encoding="utf-8")
     print(text)
     print(f"\n(guardado en {out_path})")
+
+    # únicos chequeos AUTOMÁTICOS de todo el harness (el resto lo juzga un humano/Claude leyendo el
+    # markdown) -- invariantes estructurales puntuales (expect_n_subquestions) donde un número
+    # exacto SÍ tiene una respuesta correcta objetiva, a diferencia de "¿la respuesta está bien?".
+    if subq_check_failures:
+        print(f"\n❌ {len(subq_check_failures)} chequeo(s) de expect_n_subquestions fallaron:")
+        for f in subq_check_failures:
+            print(f"   - {f}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

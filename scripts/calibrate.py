@@ -137,22 +137,29 @@ def pick_best_ambiguity(rows: list[dict]) -> float:
 
 
 def recall_at_n(retriever: Retriever, questions: list[dict], n: int) -> list[dict]:
-    """Recall@n de la etapa DENSA (coseno), antes de que el reranker reordene -- ver
-    Retriever.dense_top_n. Solo sobre preguntas con expected_doc/expected_docs (in_domain/ambiguous
-    en tests/calibration_questions.yaml); out_of_domain/no_answer no tienen "doc correcto" que
-    buscar. Importante: NO hay retrieval híbrido (denso + BM25/léxico) en este proyecto, solo denso
-    -- esto mide si ESE primer filtro (el que trae los `reranker_candidates` candidatos antes del
-    cross-encoder) ya pierde el chunk correcto antes de que el reranker tenga la oportunidad de
-    reordenarlo, no una comparación contra un retrieval léxico que no existe acá."""
+    """Recall@n del primer filtro, DENSO puro vs. HÍBRIDO (denso+BM25 fusionado por RRF), antes de
+    que el reranker reordene -- ver Retriever.dense_top_n / hybrid_top_n. Solo sobre preguntas con
+    expected_doc/expected_docs (in_domain/ambiguous en tests/calibration_questions.yaml);
+    out_of_domain/no_answer no tienen "doc correcto" que buscar. Esto mide si ese primer filtro (el
+    que trae los `reranker_candidates` candidatos antes del cross-encoder) ya pierde el chunk
+    correcto antes de que el reranker tenga la oportunidad de reordenarlo."""
     rows = []
     for q in questions:
         expected = q.get("expected_docs") or ([q["expected_doc"]] if q.get("expected_doc") else None)
         if not expected:
             continue
-        hits = retriever.dense_top_n(q["question"], n)
-        got = {h.source for h in hits}
-        hit_ok = bool(got & set(expected))
-        rows.append({"question": q["question"], "expected": expected, "got": sorted(got), "hit": hit_ok})
+        dense_hits = retriever.dense_top_n(q["question"], n)
+        hybrid_hits = retriever.hybrid_top_n(q["question"], n)
+        dense_got = {h.source for h in dense_hits}
+        hybrid_got = {h.source for h in hybrid_hits}
+        rows.append({
+            "question": q["question"],
+            "expected": expected,
+            "dense_got": sorted(dense_got),
+            "hybrid_got": sorted(hybrid_got),
+            "dense_hit": bool(dense_got & set(expected)),
+            "hybrid_hit": bool(hybrid_got & set(expected)),
+        })
     return rows
 
 
@@ -191,25 +198,39 @@ def main() -> None:
         best_s = f"{r['best_score']:.2f}" if r["best_score"] is not None else "—"
         print(f"{r['question'][:53]:<55} {r['label']:<14} {best_s:>7}  {docs}")
 
-    # ---- recall@n de la etapa densa (antes del reranker) -----------------------------------
+    # ---- recall@n: denso puro vs. híbrido (denso+BM25 por RRF), antes del reranker ---------
     recall_rows = recall_at_n(retriever, questions, args.recall_n)
-    print(f"\n## Recall@{args.recall_n} de la etapa densa (coseno, ANTES del reranker)\n")
+    print(f"\n## Recall@{args.recall_n}: denso vs. híbrido (denso+BM25 con RRF), ANTES del reranker\n")
     print(
-        f"(no hay retrieval híbrido en este proyecto -- solo denso; esto mide si el primer filtro, "
-        f"el que trae reranker_candidates={cfg.rag.reranker_candidates} candidatos para el "
-        f"cross-encoder, ya pierde el chunk correcto antes de que el reranker pueda reordenarlo)\n"
+        f"(mide si el primer filtro, el que trae reranker_candidates={cfg.rag.reranker_candidates} "
+        f"candidatos para el cross-encoder, ya pierde el chunk correcto antes de que el reranker "
+        f"pueda reordenarlo -- hybrid_enabled={cfg.rag.hybrid_enabled}, "
+        f"bm25_candidates={cfg.rag.bm25_candidates}, rrf_k={cfg.rag.rrf_k})\n"
     )
     if recall_rows:
-        hits = sum(1 for r in recall_rows if r["hit"])
+        dense_hits = sum(1 for r in recall_rows if r["dense_hit"])
+        hybrid_hits = sum(1 for r in recall_rows if r["hybrid_hit"])
         for r in recall_rows:
-            mark = "✓" if r["hit"] else "✗ PERDIDO"
-            print(f"  {mark}  {r['question'][:60]:<62} esperado={r['expected']} top{args.recall_n}={r['got']}")
-        print(f"\nRecall@{args.recall_n}: {hits}/{len(recall_rows)} ({hits / len(recall_rows):.0%})")
-        if hits < len(recall_rows):
+            dmark = "✓" if r["dense_hit"] else "✗"
+            hmark = "✓" if r["hybrid_hit"] else "✗"
+            print(f"  denso={dmark} híbrido={hmark}  {r['question'][:55]:<57} esperado={r['expected']}")
+            if not r["dense_hit"] or not r["hybrid_hit"]:
+                print(f"      denso top{args.recall_n}={r['dense_got']}  híbrido top{args.recall_n}={r['hybrid_got']}")
+        print(
+            f"\nRecall@{args.recall_n} denso:   {dense_hits}/{len(recall_rows)} ({dense_hits / len(recall_rows):.0%})"
+        )
+        print(
+            f"Recall@{args.recall_n} híbrido: {hybrid_hits}/{len(recall_rows)} ({hybrid_hits / len(recall_rows):.0%})"
+        )
+        if hybrid_hits < dense_hits:
             print(
-                f"-> hay preguntas donde el chunk correcto NO entra al top-{args.recall_n} denso: "
-                f"subir reranker_candidates (actualmente {cfg.rag.reranker_candidates}) para darle "
-                f"más candidatos al reranker, o revisar el chunking/embedding para esas preguntas."
+                "-> el híbrido pierde recall respecto del denso solo en este set: revisar bm25_candidates "
+                "o si el corpus/preguntas tienen vocabulario que BM25 penaliza de más."
+            )
+        elif dense_hits < len(recall_rows) or hybrid_hits < len(recall_rows):
+            print(
+                f"-> hay preguntas donde el chunk correcto NO entra al top-{args.recall_n}: subir "
+                f"reranker_candidates/bm25_candidates, o revisar el chunking/embedding para esas preguntas."
             )
     else:
         print("(ninguna pregunta del set tiene expected_doc/expected_docs)")

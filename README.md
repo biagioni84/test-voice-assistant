@@ -448,9 +448,8 @@ Implementado en la siguiente ronda, ver abajo.
 **Modelo**: `jinaai/jina-reranker-v2-base-multilingual` vía `fastembed.rerank.cross_encoder.TextCrossEncoder`
 (mismo paquete que ya usábamos para los embeddings densos, sin sumar `sentence-transformers`/`torch`).
 No es `bge-reranker-v2-m3` -- ese no está en el catálogo de fastembed; este es el cross-encoder
-multilingüe disponible más cercano (1.1GB, ONNX). **No hay retrieval híbrido** (denso+BM25) en este
-proyecto todavía, solo denso -- el reranker reordena candidatos del *mismo* retrieval por coseno de
-siempre, no de un híbrido. Si vale la pena sumar BM25 es una decisión aparte.
+multilingüe disponible más cercano (1.1GB, ONNX). El reranker reordena candidatos del primer filtro
+(denso, o híbrido denso+BM25 -- ver siguiente sección), no del corpus entero.
 
 **Dónde corre**: en CPU. Con Whisper + los 2 slots de llama-server ya usando ~3.6GB de los 4GB de
 VRAM, no entra (probado: solo quedan ~400-500MB libres). Igual que fastembed para los embeddings
@@ -498,6 +497,49 @@ set etiquetado, no de estos números.)*
 | `retrieval_ambiguo_dos_docs` variantes 1 y 2 | pedían aclaración (gate viejo, con falsos positivos en otros casos) | ✓ **abstienen** ("No tengo información sobre eso") -- ningún doc puntúa positivo, más honesto que forzar una aclaración |
 | `retrieval_ambiguo_dos_docs` variante 3 | alucinaba mezclando 2 docs | recupera 1 solo doc (correcto), pero el LLM **sigue malinterpretándolo** (invierte martes/jueves) -- ya no es mezcla de docs, es "bug A" puro |
 | `pregunta_compuesta` | con el gate viejo daba falso positivo; sin gate, respondía bien | ✗ regresión: el chunk correcto (tiene las dos partes) puntúa **-0.66** para esta frase compuesta/imperativa -- por debajo de `min_score`, abstiene en vez de responder. No es un problema de umbral: la pregunta pide DOS datos y ningún chunk aislado los tiene juntos de una forma que el reranker reconozca bien para frases compuestas. **Arreglado más abajo** (sección "Descomposición de preguntas compuestas") separando en sub-preguntas antes del retrieval, en vez de tocar `min_score`. |
+
+## Retrieval híbrido (denso + BM25)
+
+El primer filtro (antes del reranker) ahora combina dos rankings en vez de uno solo:
+
+- **Denso**: coseno de siempre, embeddings de `fastembed`.
+- **Léxico (BM25)**: `rank_bm25.BM25Okapi` sobre los mismos chunks, indexado en memoria (el corpus
+  es chico; con miles de chunks pasaría a un índice invertido persistente, igual que se documentó
+  para el denso con FAISS/sqlite-vec). Tokenizado para español: minúsculas, sin acentos (para que
+  "días"/"dias" matcheen igual), stopwords chicas y estándar (artículos, preposiciones, pronombres,
+  formas de ser/estar/haber/tener) -- `voice/rag.py: _tokenize`.
+- **Fusión**: Reciprocal Rank Fusion (RRF, Cormack et al. 2009) -- `score(doc) = Σ 1/(rrf_k + rank)`
+  sobre los rankings donde aparece cada doc. Los candidatos fusionados (top `reranker_candidates`)
+  son los que ve el reranker, igual que antes con el denso solo.
+
+**Por qué RRF y no una suma pesada de scores**: coseno y BM25 viven en escalas totalmente distintas
+(uno acotado 0-1, el otro sin cota, atado al vocabulario) -- normalizar y pesar esas dos escalas a
+mano es exactamente el tipo de ajuste fino contra datos puntuales que se quiere evitar (ver
+"Independencia de los documentos"). RRF fusiona por **posición** (rank), no por score, así que no
+hace falta ninguna normalización ni peso relativo entre las dos señales.
+
+**Parámetros, y por qué son arquitectura y no calibración**: `rrf_k=60` es la constante estándar del
+paper de RRF -- prácticamente nunca se ajusta por dominio, así que vive en config por transparencia,
+no porque haya que tocarla. `bm25_candidates` (cuántos trae BM25 para la fusión) sí puede necesitar
+subirse con corpus más grandes, pero eso es una cuestión de tamaño de corpus, no de qué digan los
+documentos -- no es el tipo de parámetro que calibra `scripts/calibrate.py`.
+
+**Recall@5, denso vs. híbrido** (`scripts/calibrate.py`, 9 preguntas con `expected_doc(s)` en
+`tests/calibration_questions.yaml`): **9/9 (100%) en ambos** -- con este corpus (14 chunks, 3
+documentos, todos con vocabulario simple y sin ambigüedad léxica) no hay ninguna pregunta donde el
+híbrido rescate algo que el denso ya no encontrara, así que hoy no se ve una mejora medible. Es
+esperable: el caso donde BM25 aporta de verdad es vocabulario exacto que el embedding no captura
+bien (códigos, nombres propios, siglas, términos técnicos específicos) -- con documentos genéricos y
+preguntas parafraseadas, el denso ya cubre bien. Vale la pena tenerlo desde ya como arquitectura
+para cuando lleguen documentos reales (con nombres de sistemas, códigos de ticket, siglas internas,
+etc., donde el matching léxico exacto sí puede marcar diferencia) -- recalibrar/re-medir con
+`scripts/calibrate.py` en ese momento, no ahora.
+
+**Costo**: negligible. Medido: `BM25Okapi.get_scores()` ~0.03ms, la fusión completa (`_candidate_pool`)
+~10-15ms -- comparado con el reranker (~270-580ms, con bastante varianza de corrida a corrida por el
+costo de inferencia ONNX en CPU, no relacionado a este cambio) es ruido. Confirmado con
+`hybrid_enabled=True` vs `False` en la misma máquina: la variación entre corridas es mayor que la
+diferencia entre tener o no tener BM25 activado.
 
 ## Testear el LLM/RAG con scripts/eval.py
 
@@ -616,14 +658,11 @@ calibrado actual (`calibration.toml`) es `min_score ≈ -0.68` (recupera "¿Cuá
 sueldos?", un near-miss real que con `min_score=0.0` quedaba apenas afuera) y `ambiguity_threshold`
 sin datos suficientes para recalibrar, así que queda en el default de `config.toml` (0.5).
 
-**Recall@5 de la etapa densa** (antes del reranker): `scripts/calibrate.py` también reporta si el
-primer filtro por coseno (el que trae `reranker_candidates` candidatos para el cross-encoder) ya
-pierde el chunk correcto antes de que el reranker tenga la oportunidad de reordenarlo. *Aclaración
-importante: este proyecto no tiene retrieval híbrido (denso + BM25/léxico), solo denso* -- la
-"reescritura híbrida" mencionada como posible pendiente en una ronda anterior no existe todavía, así
-que esto mide la etapa densa contra sí misma, no un léxico. Medido contra las 9 preguntas
-`in_domain`/`ambiguous` con `expected_doc(s)`: **recall@5 = 9/9 (100%)** -- con este corpus (14
-chunks en 3 documentos), trivial de cumplir; `reranker_candidates=5` no es un cuello de botella hoy.
+**Recall@5, antes del reranker**: `scripts/calibrate.py` reporta si el primer filtro (el que trae
+`reranker_candidates` candidatos para el cross-encoder) ya pierde el chunk correcto antes de que el
+reranker tenga la oportunidad de reordenarlo. *En esta ronda esto era solo denso*; el retrieval
+híbrido (denso + BM25, con la comparación recall@5 denso vs. híbrido) se agregó después -- ver
+sección "Retrieval híbrido (denso + BM25)" más abajo para el detalle completo y los resultados.
 Esta medición sí importa una vez que lleguen documentos reales y más grandes -- si el recall baja,
 la señal es subir `reranker_candidates` o revisar chunking/embeddings, no tocar `min_score`.
 
@@ -694,6 +733,18 @@ pre-filtro, para no contarlos como falsos positivos):
 - Sin regresión en los casos no compuestos (dev + validación completos, 0 caracteres CJK en toda la
   corrida).
 
+**El stop-sequence de la reescritura simple (`"?"`, `"\n"`) NO se aplica en modo descomposición**:
+`_decompose()` (`voice/llm.py`) llama a `_post()` sin pasar `stop` -- si se aplicara, la
+decodificación del array JSON de sub-preguntas cortaría en el primer `"?"` (a mitad de la primera
+sub-pregunta), el JSON quedaría inválido, y `rewrite_query()` caería silenciosamente a "no
+descompuesto". Confirmado por lectura de código y con una llamada real al servidor (JSON completo,
+sin truncar). Se agregó `rewrite_decompose_no_trunca_json` (`type: rewrite`,
+`expect_n_subquestions: 2`) a `tests/eval_questions.yaml` -- a diferencia del resto del harness
+(juicio humano/Claude), este caso se verifica **automáticamente**: si el número de sub-preguntas no
+coincide, `scripts/eval.py` termina con exit code != 0. Probado reintroduciendo el bug a propósito
+(agregando el `stop` a `_decompose()`) -- el caso falla como se espera (1 sub-pregunta en vez de 2),
+confirmando que el chequeo tiene dientes.
+
 **Diferido a propósito** (per el pivot de documentos genéricos): lookup estructurado de horarios y
 la comparación 3B vs. 7-8B quedan para cuando existan documentos reales.
 
@@ -705,7 +756,7 @@ voice/
   wakeword.py   openWakeWord (ONNX)
   vad.py        Silero VAD + segmentador de frases
   stt.py        faster-whisper (GPU)
-  rag.py        chunking + embeddings + retrieval + reranker
+  rag.py        chunking + retrieval híbrido (denso + BM25/RRF) + reranker
   rewrite.py    reescritura de consulta + descomposición de preguntas compuestas
   llm.py        llama-server (subproceso HTTP), streaming
   guardrails.py reglas deterministas (abstención, ambigüedad, anti-CJK)

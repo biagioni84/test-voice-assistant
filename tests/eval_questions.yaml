@@ -85,6 +85,22 @@
     - ["¿Y el trabajo remoto?", "Está permitido dos días por semana."]
   question: "¿y cuántos días dije que eran?"
 
+- id: rewrite_decompose_no_trunca_json
+  type: rewrite
+  compound: true
+  note: >
+    regresión puntual a vigilar: LocalLLM._decompose() (voice/llm.py) NO debe recibir
+    stop=["?", "\n"] -- ese stop es solo para la reescritura simple. El output de descomposición es
+    un array JSON de sub-preguntas, cada una terminada en "?"; si el stop se aplicara acá, la
+    decodificación cortaría en el PRIMER "?" del array (mitad de la primera sub-pregunta), el JSON
+    quedaría inválido, parse_subquestions() devolvería None, y rewrite_query() caería a la pregunta
+    original sin descomponer -- por eso expect_n_subquestions abajo es un chequeo AUTOMÁTICO
+    (no juicio humano): si algún día se rompe, este caso falla con exit code != 0, no hay que leerlo.
+  expect: "debe descomponerse en 2 sub-preguntas autónomas, no colapsar a 1 por un JSON cortado"
+  expect_n_subquestions: 2
+  history: []
+  question: "¿Qué hago si la computadora no enciende y también cuántos días de vacaciones tengo?"
+
 - id: horario_sabado_directo
   note: caso de control, pregunta simple con respuesta clara en oficina.md
   expect: "debe decir que abre de 10 a 13hs (o 'una de la tarde')"

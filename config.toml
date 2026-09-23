@@ -36,9 +36,17 @@ top_k = 2
 chunk_chars = 500           # tope para partir un párrafo gigante; NO se usa para combinar párrafos
                             # distintos entre sí (un chunk = un párrafo = un hecho, ver README)
 
-# Reranker cross-encoder (voice/rag.py): el coseno solo, trae los reranker_candidates mejores
-# candidatos; el reranker los reordena con un juicio de relevancia más fino, y ESE score (logit
-# crudo, no 0-1) es el que se compara contra min_score y ambiguity_threshold de acá abajo.
+# Retrieval híbrido (denso + BM25 léxico, fusionados por RRF) -- ver voice/rag.py. Arquitectura,
+# no calibración: rrf_k=60 es la constante estándar del paper de RRF, no se ajusta contra docs
+# puntuales. bm25_candidates sí puede subirse con corpus más grandes.
+hybrid_enabled = true
+bm25_candidates = 5
+rrf_k = 60
+
+# Reranker cross-encoder (voice/rag.py): el primer filtro (denso o híbrido de arriba) trae los
+# reranker_candidates mejores candidatos; el reranker los reordena con un juicio de relevancia más
+# fino, y ESE score (logit crudo, no 0-1) es el que se compara contra min_score y
+# ambiguity_threshold de acá abajo.
 reranker_enabled = true
 reranker_model = "jinaai/jina-reranker-v2-base-multilingual"
 reranker_candidates = 5

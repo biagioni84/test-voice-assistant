@@ -56,7 +56,14 @@ class RagCfg:
     doc_topics: dict = field(default_factory=dict)  # "archivo.md" -> "nombre de tema" para el gate
     reranker_enabled: bool = True
     reranker_model: str = "jinaai/jina-reranker-v2-base-multilingual"
-    reranker_candidates: int = 10  # cuántos candidatos trae el filtro de coseno antes de rerankear
+    reranker_candidates: int = 10  # cuántos candidatos trae el primer filtro (denso o híbrido) antes de rerankear
+    # Retrieval híbrido (denso + BM25 léxico, fusionados por RRF) -- ver voice/rag.py: Retriever.
+    # Arquitectura, no calibración: RRF con k=60 es el default estándar del paper (Cormack et al.
+    # 2009), no algo que se ajuste contra casos puntuales de docs/. bm25_candidates sí puede
+    # necesitar subirse con corpus más grandes -- por eso vive en config igual.
+    hybrid_enabled: bool = True
+    bm25_candidates: int = 10  # cuántos candidatos trae BM25 para la fusión RRF
+    rrf_k: int = 60            # constante estándar de Reciprocal Rank Fusion
 
 
 @dataclass
