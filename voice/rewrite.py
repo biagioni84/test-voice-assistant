@@ -8,7 +8,18 @@ sábado a qué hora abre.") no es autónoma -- mezcla una frase meta ("te pregun
 (sábado), y esa mezcla también confundía al LLM de respuesta. Reescribirla a una pregunta limpia
 ("¿A qué hora abre la oficina el sábado?") antes de retrieval, y pasarle SOLO esa pregunta (sin
 historial) al LLM de respuesta, ataca las dos cosas con el mismo mecanismo.
-"""
+
+"Referencia vacía" ("y eso", "y ahí") se resuelve con una regla determinista (is_empty_reference +
+resolve_empty_reference), no con el LLM: probado extensamente que el 3B es demasiado sensible a la
+redacción EXACTA de la respuesta previa (varía turno a turno aunque temperature=0, porque el
+CONTEXTO retornado por el RAG varía) -- para este patrón puntual, tan bien definido, alcanza con
+mirar la última pregunta del usuario en el historial. Más rápido además (sin llamada al LLM)."""
+
+import re
+
+# "y eso", "eso", "y ahí", "¿y ahí?", "eso mismo", "lo mismo", con o sin "¿...?" -- referencias que
+# no traen ningún dato nuevo, solo piden repetir/continuar sobre la última pregunta
+_EMPTY_REF_RE = re.compile(r"^[¿\s]*(y\s+)?(eso( mismo)?|ah[ií]|lo mismo)[\.\?\s]*$", re.IGNORECASE)
 
 SYSTEM_PROMPT = """Reescribí la última pregunta del usuario como una pregunta autónoma que se
 entienda sin el historial de la charla. Resolvé referencias ("y el domingo", "eso", "ahí") usando
@@ -25,15 +36,8 @@ SOLO la pregunta reescrita, nada más -- sin explicaciones ni comillas."""
 # tokens no vale la regresión; ver README.)
 
 # (historial [(usuario, asistente), ...], pregunta actual, reescritura esperada)
+# Nota: NO hay ejemplo para "y eso"/"y ahí" -- ver is_empty_reference(), se resuelve sin el LLM.
 _EXAMPLES: list[tuple[list[tuple[str, str]], str, str]] = [
-    (
-        # "eso"/"ahí" sin ningún sustantivo nuevo: no hay nada que resolver más que repetir la
-        # pregunta anterior (probado: sin este ejemplo, el modelo devolvía basura tipo "y ahí" que
-        # no pasa la validación y termina sin recuperar nada del RAG)
-        [("¿A qué hora abre la oficina el domingo?", "La oficina no abre el domingo, está cerrada.")],
-        "y eso",
-        "¿A qué hora abre la oficina el domingo?",
-    ),
     (
         [("¿A qué hora abre la oficina el domingo?", "La oficina no abre el domingo, está cerrada.")],
         "y los sábados",
@@ -61,6 +65,18 @@ _EXAMPLES: list[tuple[list[tuple[str, str]], str, str]] = [
 
 _MAX_WORDS = 20  # si la reescritura tiene más palabras que esto, algo salió mal (parafraseo largo,
                  # el modelo respondió la pregunta en vez de reescribirla, etc.)
+
+
+def is_empty_reference(question: str) -> bool:
+    """"y eso", "y ahí", etc: referencia sin ningún dato nuevo. Ver el docstring del módulo."""
+    return bool(_EMPTY_REF_RE.match(question.strip()))
+
+
+def resolve_empty_reference(history: list[tuple[str, str]]) -> str | None:
+    """Para una referencia vacía, la pregunta autónoma es directamente la última pregunta del
+    usuario en el historial. None si no hay historial (no debería pasar: rewrite_query ya filtra
+    ese caso antes de llegar acá)."""
+    return history[-1][0] if history else None
 
 
 def format_input(history: list[tuple[str, str]], question: str) -> str:

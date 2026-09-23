@@ -79,16 +79,14 @@ def clarify_reply(doc1: str, doc2: str, doc_topics: dict[str, str]) -> str:
     return f"Tu pregunta toca dos temas distintos: {t1} y {t2}. ¿Sobre cuál de los dos te referís?"
 
 
-def cjk_token_bias(llm, value: float = -100.0) -> dict[int, float]:
-    """logit_bias que castiga cada token del vocabulario que contenga caracteres CJK, para que el
-    modelo prácticamente nunca los elija -- prevenir en el muestreo en vez de detectar y reintentar
-    después. ~0.3s sobre un vocab de 150k tokens, se calcula una sola vez al cargar el modelo."""
-    bias = {}
-    for tid in range(llm.n_vocab()):
-        try:
-            s = llm.detokenize([tid]).decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-        if CJK_RE.search(s):
-            bias[tid] = value
-    return bias
+# Gramática GBNF para prevenir la fuga de idioma (Qwen a veces cambia a chino a mitad de una
+# respuesta). Reemplaza a un intento anterior con logit_bias sobre ~31.000 tokens CJK del
+# vocabulario: funcionaba con el modelo embebido, pero con llama-server el campo `logit_bias` del
+# request no escala -- medido: pasar de 15.000 a 31.000 entradas cuadruplica la latencia (¬1000ms de
+# overhead extra), casi seguro por una búsqueda no indexada en el servidor. Una gramática que
+# restringe los caracteres válidos por posición no tiene ese problema (medido: mismo tok/s con o sin
+# gramática) porque el compilador de gramáticas de llama.cpp arma un autómata, no una lista plana.
+CJK_GRAMMAR = (
+    r'root ::= [^　-〿぀-ゟ゠-ヿ'
+    r'一-鿿가-힣＀-￯]*'
+)

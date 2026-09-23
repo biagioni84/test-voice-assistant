@@ -60,7 +60,7 @@ class RagCfg:
 class LlmCfg:
     repo: str = "bartowski/Qwen2.5-7B-Instruct-GGUF"
     file: str = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
-    n_ctx: int = 4096
+    n_ctx: int = 4096          # total repartido entre los 2 slots de llama-server (2048 c/u)
     n_threads: int = 6
     n_gpu_layers: int = 0
     max_tokens: int = 200
@@ -69,6 +69,12 @@ class LlmCfg:
     system_prompt: str = "Eres un asistente de voz. Responde en español, breve."
     # OJO: el LLM de respuesta ya NO recibe el historial de la charla (ver voice/rewrite.py) -- por
     # eso no hay un "history_turns" acá; el que le llega al reescritor está en [rewrite].
+    # El LLM corre como subproceso llama-server (no embebido) con --parallel 2, un slot fijo por rol
+    # (0=reescritor, 1=respuesta) -- así cachear el prefijo estático del reescritor no se invalida al
+    # alternar con las llamadas de respuesta. Ver voice/llm.py y README.
+    server_bin: str = "/home/pbdev/llama.cpp/build-cuda/bin/llama-server"
+    server_host: str = "127.0.0.1"
+    server_port: int = 8811
 
 
 @dataclass

@@ -1,50 +1,95 @@
-"""LLM local con llama.cpp (GPU vía offload parcial, ver README). Dos roles distintos sobre el mismo
-modelo cargado una vez:
-  - rewrite_query(): reescribe follow-ups en preguntas autónomas usando el historial (voice/rewrite.py)
-  - stream_answer(): genera la respuesta final -- stateless, NO ve el historial de la charla (ver
-    voice/pipeline.py: quien orquesta decide qué se guarda en self.history con record_turn())
+"""LLM local vía llama-server (subproceso HTTP, no bindings embebidos).
+
+Por qué: con una sola instancia embebida de llama_cpp.Llama compartiendo un contexto entre el
+reescritor y el LLM de respuesta, cada llamada reprocesaba el prefijo entero del prompt (~800ms) --
+alternar entre los dos prompts (muy distintos entre sí) invalidaba el cacheo de prefijo automático de
+llama.cpp en cada turno. La solución no era cachear "a mano" (`save_state`/`load_state` resultó tener
+más overhead que lo que ahorra, ver README) sino no compartir un único contexto: llama-server con
+`--parallel 2` da un slot de KV cache independiente por rol (0=reescritor, 1=respuesta), y con
+`cache_prompt: true` + `id_slot` fijo por rol, cada uno mantiene su propio prefijo cacheado sin que el
+otro lo toque. Medido: prefill del reescritor bajó de ~800ms a ~80-300ms según el turno.
 """
 from __future__ import annotations
 
+import atexit
+import json
+import subprocess
+import time
 from typing import Iterator
 
-from llama_cpp import Llama
+import requests
 
 from . import rewrite
 from .config import LlmCfg, RewriteCfg, resolve
-from .guardrails import cjk_token_bias
+from .guardrails import CJK_GRAMMAR
+
+SLOT_REWRITE = 0
+SLOT_ANSWER = 1
 
 
 class LocalLLM:
     def __init__(self, cfg: LlmCfg, rewrite_cfg: RewriteCfg):
         self.cfg = cfg
         self.rewrite_cfg = rewrite_cfg
-        self.llm = Llama(
-            model_path=str(resolve("models/llm") / cfg.file),
-            n_ctx=cfg.n_ctx,
-            n_threads=cfg.n_threads,
-            n_gpu_layers=cfg.n_gpu_layers,
-            verbose=False,
-        )
+        self.base_url = f"http://{cfg.server_host}:{cfg.server_port}"
         self.history: list[dict] = []  # lo llena record_turn(); lo lee rewrite_query()
-        # penaliza tokens con caracteres CJK para prevenir la fuga de idioma (ver voice/guardrails.py
-        # y README) en vez de detectarla después y reintentar. Se usa en ambos roles.
-        self._cjk_bias = cjk_token_bias(self.llm)
-        # NO se cachea el prefijo estático del reescritor con save_state()/load_state(): medido y
-        # descartado (ver README) -- el costo de load_state() (~350-760ms, con o sin offload a GPU)
-        # es igual o peor que el prefill que se ahorra. Mitigación real: pocos ejemplos few-shot
-        # (voice/rewrite.py) para que el prefijo en sí sea chico.
+
+        self._proc = self._start_server()
+        atexit.register(self.close)
+        self._wait_ready()
+
+    def _start_server(self) -> subprocess.Popen:
+        cmd = [
+            self.cfg.server_bin,
+            "-m", str(resolve("models/llm") / self.cfg.file),
+            "--host", self.cfg.server_host,
+            "--port", str(self.cfg.server_port),
+            "--parallel", "2",
+            "-c", str(self.cfg.n_ctx),
+            "-ngl", str(self.cfg.n_gpu_layers),
+            "-t", str(self.cfg.n_threads),
+            "--slot-save-path", "/tmp/llama-server-slots",  # necesario para habilitar /slots?action=erase
+            "--no-webui",
+        ]
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _wait_ready(self, timeout: float = 90.0) -> None:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if self._proc.poll() is not None:
+                raise RuntimeError(f"llama-server terminó solo (exit code {self._proc.returncode}) -- revisar {self.cfg.server_bin}")
+            try:
+                if requests.get(f"{self.base_url}/health", timeout=1).ok:
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(0.3)
+        raise RuntimeError("llama-server no respondió a tiempo en /health")
+
+    def close(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
 
     def reset(self) -> None:
-        """Arranca una charla nueva de cero: limpia self.history y también el contexto interno de
-        llama.cpp (self.llm.reset(), que resetea n_tokens). No cuesta nada y es lo correcto para no
-        acumular contexto sin límite entre charlas -- aunque, en la investigación de un bug de
-        "y eso" que se resolvía mal, esto NO resultó ser la causa (ver README): la causa real era
-        que el texto de respuesta usado en los ejemplos few-shot de voice/rewrite.py no coincidía
-        con lo que el LLM de respuesta genera de verdad, y una versión más corta del system_prompt
-        del reescritor no generalizaba bien esa diferencia."""
+        """Arranca una charla nueva: limpia self.history y borra el KV cache de los dos slots.
+
+        Se probó NO borrar (para no perder el prefijo estático cacheado entre charlas) y se encontró
+        un bug real: el matching de prefijo de llama-server compara tokens exactos, y si una charla
+        nueva comparte un prefijo largo por casualidad con contenido de una charla anterior sin
+        relación (ej. el mismo prefijo estático + algo de contenido dinámico que coincide un rato),
+        el server puede servir una completion mezclada con esa cola vieja -- reprodujo el bug de
+        "y ahí" que ya se había arreglado. Borrar es lo seguro. El costo se paga una vez por charla
+        (no por turno): dentro de la MISMA charla, los turnos siguientes sí cachean bien."""
         self.history.clear()
-        self.llm.reset()
+        for slot in (SLOT_REWRITE, SLOT_ANSWER):
+            try:
+                requests.post(f"{self.base_url}/slots/{slot}", params={"action": "erase"}, timeout=5)
+            except requests.RequestException:
+                pass
 
     def record_turn(self, question: str, answer: str) -> None:
         """Guarda la pregunta ORIGINAL del usuario (no la reescrita) y la respuesta -- así el
@@ -53,6 +98,19 @@ class LocalLLM:
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
         ]
+
+    def _post(self, messages: list[dict], id_slot: int, max_tokens: int, temperature: float, stream: bool):
+        payload = {
+            "model": "local",
+            "messages": messages,
+            "id_slot": id_slot,
+            "cache_prompt": True,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "grammar": CJK_GRAMMAR,  # ver voice/guardrails.py: gramática en vez de logit_bias grande
+            "stream": stream,
+        }
+        return requests.post(f"{self.base_url}/v1/chat/completions", json=payload, stream=stream, timeout=60)
 
     def rewrite_query(self, question: str) -> tuple[str, bool]:
         """Reescribe `question` como pregunta autónoma usando self.history. No hace nada (pasa la
@@ -66,18 +124,17 @@ class LocalLLM:
         for i in range(0, len(hist) - 1, 2):
             pairs.append((hist[i]["content"], hist[i + 1]["content"]))
 
+        if rewrite.is_empty_reference(question):
+            resolved = rewrite.resolve_empty_reference(pairs)
+            if resolved:
+                return resolved, True
+
         messages = [
             {"role": "system", "content": rewrite.SYSTEM_PROMPT},
             *rewrite.few_shot_messages(),
             {"role": "user", "content": rewrite.format_input(pairs, question)},
         ]
-        resp = self.llm.create_chat_completion(
-            messages=messages,
-            max_tokens=self.rewrite_cfg.max_tokens,
-            temperature=0.0,
-            logit_bias=self._cjk_bias,
-            stream=False,
-        )
+        resp = self._post(messages, SLOT_REWRITE, self.rewrite_cfg.max_tokens, 0.0, stream=False).json()
         out = resp["choices"][0]["message"]["content"].strip()
         if rewrite.looks_like_question(out):
             return out, True
@@ -92,13 +149,16 @@ class LocalLLM:
             {"role": "system", "content": self.cfg.system_prompt},
             {"role": "user", "content": user},
         ]
-        for part in self.llm.create_chat_completion(
-            messages=messages,
-            max_tokens=self.cfg.max_tokens,
-            temperature=self.cfg.temperature,
-            logit_bias=self._cjk_bias,
-            stream=True,
-        ):
-            tok = part["choices"][0]["delta"].get("content")
-            if tok:
-                yield tok
+        r = self._post(messages, SLOT_ANSWER, self.cfg.max_tokens, self.cfg.temperature, stream=True)
+        for line in r.iter_lines():
+            if not line:
+                continue
+            s = line.decode("utf-8")
+            if not s.startswith("data: "):
+                continue
+            payload = s[6:]
+            if payload.strip() == "[DONE]":
+                break
+            delta = json.loads(payload)["choices"][0]["delta"].get("content")
+            if delta:
+                yield delta

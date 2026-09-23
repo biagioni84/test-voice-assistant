@@ -61,13 +61,19 @@ ambiguity_threshold = 0.10  # si los 2 docs con mejor score están a menos que e
 # vuelve más lento (incluso Whisper, que comparte GPU). Por eso el default sigue siendo el 3B.
 repo = "bartowski/Qwen2.5-3B-Instruct-GGUF"
 file = "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
-n_ctx = 4096
+n_ctx = 4096                # total, repartido en 2 slots de 2048 (ver server_* abajo)
 n_threads = 6              # solo importa para las capas que queden en CPU
 n_gpu_layers = 28          # subir a -1 si nada más usa la GPU y querés el máximo; bajar si ves OOM
 max_tokens = 200
 temperature = 0.0          # greedy/determinístico. Con >0 la misma conversación podía dar resultados
                             # distintos entre corridas (ver tests/eval_questions.yaml); con 0 se puede
                             # comparar de verdad si un cambio arregló algo, sin ruido de muestreo
+# LLM como subproceso llama-server (no embebido) -- ver voice/llm.py y README. server_bin apunta al
+# binario compilado con CUDA en /home/pbdev/llama.cpp/build-cuda (build propio de esta máquina, no
+# viene con el repo: ver README para compilarlo).
+server_bin = "/home/pbdev/llama.cpp/build-cuda/bin/llama-server"
+server_host = "127.0.0.1"
+server_port = 8811
 # El LLM de respuesta YA NO recibe el historial de la charla (ver [rewrite] y voice/rewrite.py): recibe
 # la pregunta ya reescrita como autónoma + el CONTEXTO de este turno, nada más. Antes el system_prompt
 # tenía una regla de "priorizá el CONTEXTO sobre lo que dijiste antes" -- ya no aplica, no hay "antes".

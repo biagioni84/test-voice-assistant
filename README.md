@@ -272,49 +272,101 @@ Próximos pasos, en orden: mejorar el chunking (separar hechos que hoy están me
 chunk) → un lookup estructurado de horarios en vez de texto libre → si nada de eso alcanza, un modelo
 más grande (7-8B o el MoE de la sección de la Orin).
 
-## Latencia del reescritor: dos intentos, dos callejones sin salida
+## Latencia del reescritor: dos callejones sin salida, y una migración que sí funcionó
 
 Antes de perseguir un número de latencia absoluto en esta laptop (RTX 3050, no es el hardware de
 destino -- la Orin), se midieron métricas portables con `verbose=True` de llama.cpp:
 
 - La llamada al reescritor (~616 tokens de prompt, ~10-30 de salida) se reparte en **793ms de
   prefill (616 tokens) vs 319ms de decode (~11 tokens)** -- el prefill domina, no la generación.
-- **9 de 36 capas del LLM están en CPU** (`n_gpu_layers=28`, ver sección de LLM más arriba) -- eso
-  ya se sabía y está documentado, pero se confirma que afecta tanto prefill como decode (cada
-  forward pass pasa por esas 9 capas en CPU).
-- **569 de esos 616 tokens (92%) son el prefijo estático** (system prompt + 5 ejemplos few-shot de
-  `voice/rewrite.py`) -- se repite idéntico en cada llamada.
+- **9 de 36 capas del LLM están en CPU** (`n_gpu_layers=28`) -- afecta tanto prefill como decode.
+- **569 de esos 616 tokens (92%) son el prefijo estático** (system prompt + few-shot de
+  `voice/rewrite.py`), idéntico en cada llamada.
 
-Con ese 92% estático, cachearlo parecía el punto obvio. Se probaron dos caminos, y **ninguno dio una
-mejora neta**:
+Con ese 92% estático, cachearlo parecía el punto obvio. Se probaron dos caminos con el LLM **embebido**
+(`llama_cpp.Llama`), y **ninguno dio una mejora neta**:
 
-1. **`Llama.save_state()`/`load_state()`** (el equivalente en llama-cpp-python a "cache_prompt"):
-   sí evita reprocesar el prefijo (confirmado: prefill bajó de 616 a 54 tokens), pero `load_state()`
-   en sí mismo cuesta 350-760ms -- un round-trip de memoria que se come el ahorro. Medido también con
-   el modelo 100% en GPU (`n_gpu_layers=-1`, para descartar que fuera el split CPU/GPU): mismo
-   resultado, `load_state()` sigue costando más de lo que ahorra. Es una limitación de cómo
+1. **`Llama.save_state()`/`load_state()`**: sí evita reprocesar el prefijo (prefill bajó de 616 a 54
+   tokens), pero `load_state()` en sí mismo cuesta 350-760ms -- más de lo que ahorra. Confirmado
+   también con el modelo 100% en GPU (`n_gpu_layers=-1`), mismo resultado: es una limitación de cómo
    `llama-cpp-python` serializa el estado, no del hardware. **Revertido.**
-2. **Condensar el system prompt** (238→131 tokens, prefijo total 569→462, -19%): en un test aislado
-   con texto de historial escrito a mano parecía funcionar igual de bien -- pero ese test tenía un
-   sesgo: usaba el mismo texto exacto que el ejemplo few-shot. Con texto **real** generado por el LLM
-   de respuesta (que nunca coincide palabra por palabra con el few-shot), la versión condensada
-   fallaba justo en el caso "y eso" que costó arreglar antes. La instrucción más larga y repetitiva
-   generaliza mejor aunque "diga lo mismo" en menos palabras -- una lección de prompt engineering más
-   que de ingeniería de sistemas. **Revertido.**
+2. **Condensar el system prompt** (238→131 tokens): en un test aislado con texto escrito a mano
+   parecía funcionar -- pero el test tenía trampa (coincidía exacto con el few-shot). Con texto real
+   del LLM de respuesta, la versión condensada fallaba el caso "y eso". **Revertido.**
 
-La latencia real (con el prompt largo, sin cache, offload parcial) quedó donde estaba: **p50≈870ms,
-p95≈1000ms cuando el reescritor corre** (n=27, ver corrida completa más abajo). No hubo mejora en esta
-máquina. El objetivo de p95 queda pendiente de medir en la Orin real, donde tanto el ancho de banda de
-memoria como la disponibilidad de VRAM (64GB, sin necesidad de partial offload) son estructuralmente
-distintos -- una segunda instancia de `Llama` dedicada solo al reescritor (para que el cacheo de
-prefijo *nativo* de llama.cpp funcione sin interferencia de las llamadas de respuesta intercaladas)
-sería viable ahí por VRAM y no acá (duplicaría los pesos del modelo en GPU).
+**La causa raíz real**: el reescritor y el LLM de respuesta compartían una sola instancia embebida con
+un único contexto. Alternar entre sus dos prompts (muy distintos entre sí) invalidaba el cacheo de
+prefijo automático de llama.cpp en cada turno -- no es algo que se arregle cacheando "a mano" con una
+sola instancia, hace falta que cada rol tenga su propio contexto.
 
-**Bug real encontrado en el camino** (no relacionado con la latencia): `Assistant.run()` nunca
+**La migración que funcionó: llama-server con `--parallel 2`.** En vez del binding embebido, el LLM
+corre como subproceso (`voice/llm.py`, HTTP a `127.0.0.1:8811`), con 2 slots de KV cache
+independientes -- `id_slot=0` fijo para el reescritor, `id_slot=1` para la respuesta -- y
+`cache_prompt: true` en cada request. Cada slot mantiene su propio prefijo cacheado sin que el otro lo
+toque. Compilado desde el repo de llama.cpp con CUDA (no es un paquete de pip, ver "Instalar" abajo).
+
+Medido en aislado: la primera llamada a un slot procesa el prompt completo (~800ms); las siguientes
+con el mismo prefijo estático solo reprocesan la cola dinámica (~25-300ms). Bien por debajo del
+objetivo original de <100ms de prefill en la mayoría de los casos.
+
+**Tres bugs reales aparecieron en el camino, cada uno con su propio diagnóstico:**
+
+1. **`logit_bias` no escala en el server.** El enfoque anti-CJK del round anterior (`-100` sobre
+   ~31.000 tokens del vocabulario) funcionaba bien embebido, pero vía HTTP el campo `logit_bias` del
+   request no escala: medido, pasar de 15.000 a 31.000 entradas **cuadruplica** la latencia (~1000ms
+   de overhead extra, casi seguro una búsqueda no indexada del lado del servidor). Reemplazado por una
+   **gramática GBNF** (`voice/guardrails.py: CJK_GRAMMAR`) que restringe los caracteres válidos por
+   posición -- medido: mismo tok/s con o sin gramática, porque el compilador de gramáticas arma un
+   autómata en vez de recorrer una lista plana. Bonus: ya no hace falta cargar el modelo (ni siquiera
+   en modo `vocab_only`) solo para calcular el bias.
+   - *Bug de sintaxis en el camino*: la primera versión de la gramática usaba escapes `\x{XXXX}`
+     (sintaxis PCRE/Python) en vez de `\uXXXX` (sintaxis real de GBNF) -- el parser los toleraba sin
+     tirar error pero la gramática no restringía nada de verdad, así que una fuga de CJK pasó igual en
+     una corrida completa antes de notarlo. Corregido y verificado con 0 caracteres CJK en 43 casos.
+2. **No borrar el KV cache entre charlas contamina charlas distintas.** Para no perder el prefijo
+   cacheado, se probó NO borrar los slots entre conversaciones (`reset_conversation()`). Bug real: el
+   matching de prefijo de llama-server compara tokens exactos, y si una charla nueva comparte un
+   prefijo largo por casualidad con contenido de una charla anterior sin relación, el server puede
+   servir una completion mezclada con esa cola vieja -- reprodujo el bug de "y ahí" que ya se había
+   arreglado en la ronda anterior. `reset_conversation()` vuelve a borrar los dos slots
+   (`/slots/{id}?action=erase`, requiere `--slot-save-path`); el costo se paga una vez por charla, no
+   por turno -- dentro de la misma charla, los turnos siguientes sí cachean bien.
+3. **"y eso" seguía siendo frágil incluso con el prefijo exacto del few-shot.** Después de arreglar 1
+   y 2, "y eso" todavía fallaba -- diagnosticado a fondo (aislando grammar, cache_prompt, id_slot uno
+   por uno) hasta confirmar que era el modelo mismo, de forma estable y no por empate de logits
+   (probado con distintas seeds y algo de temperature, mismo resultado siempre). El LLM de respuesta
+   genera una frase ligeramente distinta a la del ejemplo few-shot turno a turno (aunque
+   `temperature=0`, porque el CONTEXTO recuperado varía un poco), y el 3B no generalizaba de forma
+   confiable a esa variación. **Fix**: en vez de seguir puliendo el prompt, "referencia vacía" ("y
+   eso", "y ahí", "eso mismo", "lo mismo") se resuelve con una regla determinista
+   (`voice/rewrite.py: is_empty_reference` + `resolve_empty_reference`) que devuelve directamente la
+   última pregunta del historial, sin llamar al LLM -- más simple, 100% confiable, y de paso más
+   rápido para el patrón de follow-up más común.
+
+**Resultado final** (43 casos, `tests/eval_questions.yaml`): **p50≈545-670ms** (bajó de ~870ms, con
+variación entre corridas por el ruido normal de un proceso compartiendo la máquina), sin regresiones
+en identidad/chiste/cambio-de-día, y "y eso" ahora resuelve en 0ms (no llama al LLM). Un caso nuevo
+sigue fallando (`comentario_sin_tema_no_corta_continuidad`: el LLM de respuesta ignora un chunk con
+score muy superior -0.81 vs 0.49- y responde con el menos relevante) -- es la misma familia de "bug A"
+(fidelidad al contexto) que ya estaba documentada como fuera de alcance de este trabajo, no una
+regresión nueva de la migración.
+
+**Bug real encontrado en el camino, no relacionado con la latencia**: `Assistant.run()` nunca
 reseteaba `self.llm.history` entre ventanas de conversación separadas (solo `scripts/eval.py` lo
-hacía, vía `reset_conversation()`). En uso real esto significa que una charla nueva ("hey jarvis,
-contame un chiste") podía arrastrar el historial de una charla previa sin relación, horas antes.
-Arreglado: `run()` llama a `reset_conversation()` al cerrarse cada ventana de conversación.
+hacía). En uso real esto significa que una charla nueva podía arrastrar el historial de una charla
+previa sin relación, horas antes. Arreglado: `run()` llama a `reset_conversation()` al cerrarse cada
+ventana de conversación.
+
+**Instalar llama-server con CUDA** (no es un paquete de pip, se compila desde el repo de llama.cpp):
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build-cuda -DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cuda --target llama-server -j"$(nproc)"
+```
+(86 = compute capability de RTX 30xx; ajustar si es otra GPU.) `config.toml` → `[llm].server_bin`
+apunta al binario resultante -- por defecto asume `/home/pbdev/llama.cpp/build-cuda/bin/llama-server`,
+ajustar a donde se haya compilado.
 
 ## Dev vs. validación en scripts/eval.py
 

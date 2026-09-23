@@ -25,12 +25,17 @@ huggingface_hub
 scipy
 scikit-learn
 tqdm
+
+# cliente HTTP para llama-server (voice/llm.py) -- el LLM ya no corre embebido, ver README
 requests
 
 # Instalar aparte:
 #   uv pip install --no-deps openwakeword
 #
-#   llama-cpp-python CON soporte CUDA (imprescindible para que el LLM no vaya muy lento; ver README):
-#   CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86" FORCE_CMAKE=1 \
-#     uv pip install --no-binary llama-cpp-python llama-cpp-python
-#   (86 = compute capability de RTX 30xx/Ampere; ajustar si es otra GPU)
+#   llama-cpp-python -- YA NO hace falta compilarla con CUDA (el LLM corre en llama-server, un
+#   binario aparte, no embebido). Alcanza con el wheel CPU normal: se usa solo en modo vocab_only
+#   (voice/guardrails.py: cjk_token_bias_for_model), que no toca GPU ni pesos.
+#   uv pip install llama-cpp-python
+#
+#   llama-server CON CUDA: se compila desde el repo de llama.cpp (no es un paquete de pip). Ver
+#   README, sección "LLM vía llama-server", para los pasos completos.
