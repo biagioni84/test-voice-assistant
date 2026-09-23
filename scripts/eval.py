@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 import voice  # noqa: F401,E402  (importa llama_cpp primero)
 from voice import rewrite  # noqa: E402
 from voice.config import load_config  # noqa: E402
+from voice.guardrails import CJK_RE  # noqa: E402
 from voice.pipeline import Assistant  # noqa: E402
 
 rewrite_latencies_ms: list[float] = []  # se llena en run_case(), se reporta al final
@@ -36,6 +37,24 @@ subq_check_failures: list[str] = []  # casos con expect_n_subquestions que no di
 history_check_failures: list[str] = []  # turnos donde self.llm.history no creció (record_turn no se llamó)
 canonical_check_failures: list[str] = []  # casos con expect_canonical_*/expect_exact_text/etc que no dieron lo esperado
 gate_check_failures: list[str] = []  # casos con expect_clarify/expect_context_restricted_to que no dieron lo esperado
+content_check_failures: list[str] = []  # casos con expect_contains/expect_not_contains/expect_abstain/etc
+cjk_check_failures: list[str] = []  # CUALQUIER turno (o salida de reescritura) con caracteres CJK -- chequeo universal, sin campo
+
+# Plantillas fijas de voice/guardrails.py: abstain_reply() -- para expect_abstain. Comparación
+# exacta a propósito: son texto FIJO, no generado, así que no hay variación legítima que tolerar.
+_ABSTAIN_TEXTS = {
+    "No lo encontré, ¿me lo preguntás de otra forma?",
+    "No tengo información sobre esa persona.",
+    "No tengo información sobre eso.",
+}
+
+
+def _check_cjk(label: str, text: str) -> None:
+    """Chequeo AUTOMÁTICO y UNIVERSAL (no necesita campo expect_*, corre siempre): ningún texto que
+    se muestra/habla debería tener caracteres CJK (ver voice/guardrails.py: CJK_RE, CJK_GRAMMAR).
+    Antes esto se verificaba a mano contando caracteres en el .md generado; ahora es un assert real."""
+    if CJK_RE.search(text):
+        cjk_check_failures.append(f"{label}: {text!r}")
 
 
 def case_variants(case: dict) -> list[tuple[str | None, list[str]]]:
@@ -87,6 +106,28 @@ def run_rewrite_case(bot: Assistant, case: dict) -> list[str]:
         lines.append(f"  - ➜ descompuesta en {len(subqs)}: **{sub_txt}** (se_reescribió={was_rewritten}, {dt_ms:.0f}ms)")
     else:
         lines.append(f"  - ➜ reescrita: **{subqs[0]}** (se_reescribió={was_rewritten}, {dt_ms:.0f}ms)")
+
+    out_text = " | ".join(subqs)
+    _check_cjk(f"{case['id']} (rewrite)", out_text)
+
+    expect_was_rewritten = case.get("expect_was_rewritten")
+    if expect_was_rewritten is not None:
+        ok = was_rewritten == expect_was_rewritten
+        lines.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_was_rewritten={expect_was_rewritten} (obtuvo {was_rewritten})")
+        if not ok:
+            content_check_failures.append(f"{case['id']}: expect_was_rewritten={expect_was_rewritten}, obtuvo {was_rewritten}")
+
+    for needle in case.get("expect_contains", []):
+        ok = needle.lower() in out_text.lower()
+        lines.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_contains {needle!r}")
+        if not ok:
+            content_check_failures.append(f"{case['id']}: no contiene {needle!r} -- salida: {out_text!r}")
+    for needle in case.get("expect_not_contains", []):
+        ok = needle.lower() not in out_text.lower()
+        lines.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_not_contains {needle!r}")
+        if not ok:
+            content_check_failures.append(f"{case['id']}: contiene {needle!r} (no debería) -- salida: {out_text!r}")
+
     lines.append("")
     return lines
 
@@ -147,11 +188,93 @@ def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], sh
                 lines.append(f"  - 🔎 {tr['subq']!r}: top1={top1} top2={top2}")
         for cm in turn.canonical_matches:
             lines.append(f"  - 📌 canonical:{cm['entry_id']}@{cm['score']:.2f}")
+        _check_cjk(f"{case['id']}{suffix} ({q!r})", turn.answer)
         turn_results.append(turn)
     lines += _check_canonical_expectations(case, turn_results)
     lines += _check_gate_expectations(case, turn_results)
+    lines += _check_content_expectations(case, turn_results)
     lines.append("")
     return lines
+
+
+def _check_content_expectations(case: dict, turn_results: list) -> list[str]:
+    """Chequeos AUTOMÁTICOS sobre el CONTENIDO de la respuesta -- para casos donde la salida del
+    LLM no se puede comparar textual (varía turno a turno aunque temperature=0, ver README), se
+    verifica lo que SÍ es estable: presencia/ausencia de datos concretos, si abstuvo, si coincide
+    con un turno anterior, o el documento usado como CONTEXTO. Todos opcionales, aplicados al
+    ÚLTIMO turno salvo que se diga lo contrario:
+      expect_abstain: true -- el último turno debe ser exactamente una de las plantillas fijas de
+        abstención (voice/guardrails.py: abstain_reply) -- comparación EXACTA, son texto fijo.
+      expect_contains: [str, ...] -- TODAS estas substrings (case-insensitive) deben aparecer en
+        la respuesta del último turno.
+      expect_not_contains: [str, ...] -- NINGUNA de estas substrings debe aparecer en el último turno.
+      expect_not_contains_any_turn: [str, ...] -- como expect_not_contains pero revisa TODOS los
+        turnos de la conversación, no solo el último (para casos multi-turno donde el riesgo es
+        que aparezca en CUALQUIER punto, no solo al final).
+      expect_contains_each_turn: [[str,...], [str,...], ...] -- una lista de listas, un elemento
+        por turno (en el mismo orden que `turns`); lista vacía = sin chequeo para ese turno
+        (documenta explícitamente qué turno se deja sin aserción y por qué, en vez de omitirlo).
+      expect_doc: <archivo> -- alias de expect_context_restricted_to para casos sin gate
+        (RAG normal): el CONTEXTO del último turno debe venir de ese único documento.
+      expect_same_as_previous: true -- el último turno debe responder EXACTAMENTE lo mismo que el
+        anterior (consistencia). NOTA: temperature=0 debería ser determinístico, pero se observó
+        alguna variación por efectos de batching de la GPU (ver README) -- si este chequeo falla
+        de forma intermitente sin cambios de código, es señal de esa varianza, no necesariamente
+        un bug nuevo."""
+    out: list[str] = []
+    cid = case["id"]
+    last = turn_results[-1]
+
+    if case.get("expect_abstain"):
+        ok = last.answer in _ABSTAIN_TEXTS
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_abstain (obtuvo {last.answer!r})")
+        if not ok:
+            content_check_failures.append(f"{cid}: expect_abstain -- obtuvo {last.answer!r}, no es ninguna plantilla fija")
+
+    for needle in case.get("expect_contains", []):
+        ok = needle.lower() in last.answer.lower()
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_contains {needle!r}")
+        if not ok:
+            content_check_failures.append(f"{cid}: no contiene {needle!r} -- respuesta: {last.answer!r}")
+
+    for needle in case.get("expect_not_contains", []):
+        ok = needle.lower() not in last.answer.lower()
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_not_contains {needle!r}")
+        if not ok:
+            content_check_failures.append(f"{cid}: contiene {needle!r} (no debería) -- respuesta: {last.answer!r}")
+
+    for needle in case.get("expect_not_contains_any_turn", []):
+        offenders = [i for i, t in enumerate(turn_results, 1) if needle.lower() in t.answer.lower()]
+        ok = not offenders
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_not_contains_any_turn {needle!r}")
+        if not ok:
+            content_check_failures.append(f"{cid}: {needle!r} aparece en el/los turno(s) {offenders} (no debería en ninguno)")
+
+    each_turn = case.get("expect_contains_each_turn")
+    if each_turn is not None:
+        for i, (needles, turn) in enumerate(zip(each_turn, turn_results), 1):
+            for needle in needles:
+                ok = needle.lower() in turn.answer.lower()
+                out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: turno {i} expect_contains {needle!r}")
+                if not ok:
+                    content_check_failures.append(f"{cid}: turno {i} no contiene {needle!r} -- respuesta: {turn.answer!r}")
+
+    expect_doc = case.get("expect_doc")
+    if expect_doc is not None:
+        docs = {h.source for h in last.context_hits}
+        ok = docs == {expect_doc}
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_doc={expect_doc!r} (obtuvo docs={sorted(docs)!r})")
+        if not ok:
+            content_check_failures.append(f"{cid}: expect_doc={expect_doc!r}, obtuvo docs={sorted(docs)!r}")
+
+    if case.get("expect_same_as_previous"):
+        prev = turn_results[-2]
+        ok = last.answer == prev.answer
+        out.append(f"  - {'✓' if ok else '✗ FALLÓ'}: expect_same_as_previous (anterior={prev.answer!r}, último={last.answer!r})")
+        if not ok:
+            content_check_failures.append(f"{cid}: expect_same_as_previous -- anterior={prev.answer!r} != último={last.answer!r}")
+
+    return out
 
 
 def _check_gate_expectations(case: dict, turn_results: list) -> list[str]:
@@ -248,6 +371,45 @@ def _check_canonical_expectations(case: dict, turn_results: list) -> list[str]:
             )
 
     return out
+
+
+# Campos que cuentan como "este caso tiene al menos un chequeo automático" -- todo lo que termina
+# revisado por alguna de las funciones _check_*_expectations de arriba. El campo `expect` (prosa
+# libre) NO cuenta: sigue siendo juicio humano/Claude, a propósito (ver docstring del módulo).
+_AUTO_ASSERTION_FIELDS = [
+    "expect_n_subquestions", "expect_was_rewritten", "expect_contains", "expect_not_contains",
+    "expect_canonical_entries", "expect_exact_text", "expect_variant_rotation",
+    "expect_repeat_of_previous", "expect_clarify", "expect_context_restricted_to",
+    "expect_abstain", "expect_not_contains_any_turn", "expect_contains_each_turn",
+    "expect_doc", "expect_same_as_previous",
+]
+
+
+def _count_assertions(cases: list[dict]) -> dict:
+    """Cobertura de aserciones automáticas por caso y por split -- para el reporte final (ver
+    main()) y para que quede a la vista cuáles casos siguen sin ninguna, con su propio `note` como
+    explicación (en vez de tener que buscarlos)."""
+    by_split: dict[str, list[str]] = {}
+    without: list[tuple[str, str]] = []  # (id, note) de los que no tienen ningún expect_* automático
+    for c in cases:
+        split = c.get("split", "dev")
+        has_check = any(f in c for f in _AUTO_ASSERTION_FIELDS)
+        by_split.setdefault(split, [0, 0])
+        by_split[split][0] += 1
+        if has_check:
+            by_split[split][1] += 1
+        else:
+            without.append((c["id"], (c.get("note") or "").strip().split("\n")[0][:100]))
+    total = len(cases)
+    with_check = sum(v[1] for v in by_split.values())
+    print("\n**Cobertura de aserciones automáticas por split:**")
+    for split, (tot, ok) in by_split.items():
+        print(f"  {split}: {ok}/{tot} casos con al menos un chequeo automático")
+    if without:
+        print(f"\n**{len(without)} caso(s) SIN aserción automática** (solo `expect:` en prosa, juicio humano/Claude):")
+        for cid, note in without:
+            print(f"  - {cid}: {note or '(sin nota -- revisar por qué)'}")
+    return {"with": with_check, "total": total, "without": total - with_check}
 
 
 def main() -> None:
@@ -361,7 +523,16 @@ def main() -> None:
     # chequeos AUTOMÁTICOS del harness (el resto lo juzga un humano/Claude leyendo el markdown) --
     # invariantes estructurales donde SÍ hay una respuesta correcta objetiva, a diferencia de
     # "¿la respuesta está bien?".
-    all_failures = subq_check_failures + history_check_failures + canonical_check_failures + gate_check_failures
+    all_failures = (
+        subq_check_failures + history_check_failures + canonical_check_failures + gate_check_failures
+        + content_check_failures + cjk_check_failures
+    )
+    n_checks = _count_assertions(cases)
+    print(
+        f"\n**Cobertura de aserciones automáticas**: {n_checks['with']} de {n_checks['total']} casos "
+        f"tienen al menos un chequeo automático ({n_checks['without']} sin ninguno -- ver el reporte "
+        f"de más arriba o README para por qué en cada caso)."
+    )
     if all_failures:
         if subq_check_failures:
             print(f"\n❌ {len(subq_check_failures)} chequeo(s) de expect_n_subquestions fallaron:")
@@ -379,7 +550,16 @@ def main() -> None:
             print(f"\n❌ {len(gate_check_failures)} chequeo(s) del gate de ambigüedad/confianza fallaron:")
             for f in gate_check_failures:
                 print(f"   - {f}")
+        if content_check_failures:
+            print(f"\n❌ {len(content_check_failures)} chequeo(s) de contenido fallaron:")
+            for f in content_check_failures:
+                print(f"   - {f}")
+        if cjk_check_failures:
+            print(f"\n❌ {len(cjk_check_failures)} caso(s) con caracteres CJK:")
+            for f in cjk_check_failures:
+                print(f"   - {f}")
         sys.exit(1)
+    print("\n✅ todos los chequeos automáticos pasaron")
 
 
 if __name__ == "__main__":

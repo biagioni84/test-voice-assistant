@@ -14,6 +14,10 @@ word) -- no hace falta y así corre en segundos, no minutos.
     python scripts/calibrate.py                    # calibra y escribe calibration.toml
     python scripts/calibrate.py --dry-run           # solo el reporte, no escribe nada
     python scripts/calibrate.py --questions otro.yaml
+    python scripts/calibrate.py --check             # NO recalibra: valida que calibration.toml
+                                                     # vigente siga sin casos peligrosos + corre el
+                                                     # lint de contenido. Exit code != 0 si falla --
+                                                     # pensado para scripts/verify.py (ver README).
 """
 import argparse
 import sys
@@ -212,6 +216,93 @@ def pick_best_canonical_threshold(rows: list[dict]) -> float:
     return min(rows, key=lambda r: (r["dangerous"], -r["threshold"]))["threshold"]
 
 
+def run_check(cfg, questions_path: Path, canonical_questions_path: Path) -> bool:
+    """Modo --check: NO recalibra (no barre umbrales, no escribe calibration.toml) -- valida que
+    los umbrales VIGENTES (los que ya aplicó _apply_calibration) sigan sin producir casos
+    peligrosos contra los sets de calibración, y corre el lint de contenido (doc_topics,
+    clarify_reply, respuestas canónicas). Pensado para correr rápido antes de cada commit (ver
+    scripts/verify.py) -- si algo cambió en el contenido y el umbral vigente ya no es seguro, hay
+    que volver a correr `scripts/calibrate.py` (sin --check) para recalibrar, no ajustar a mano."""
+    from voice import guardrails
+
+    print("Cargando retriever + canonical (embeddings + reranker)…", flush=True)
+    retriever = Retriever(cfg.rag)
+    canonical = CanonicalMatcher(cfg.canonical) if cfg.canonical.enabled else None
+
+    ok = True
+
+    # ---- lint de contenido (doc_topics + clarify_reply + respuestas canónicas ya se lintean al
+    # cargar CanonicalMatcher, arriba) -------------------------------------------------------
+    print("\n## Lint de contenido\n")
+    lint_warnings = 0
+    for doc, topic in cfg.rag.doc_topics.items():
+        for w in guardrails.lint_for_voice(topic, label=f"doc_topics[{doc!r}]"):
+            print(f"  ⚠ {w}")
+            lint_warnings += 1
+    if len(cfg.rag.doc_topics) >= 2:
+        sample_docs = list(cfg.rag.doc_topics)[:2]
+        sample_msg = guardrails.clarify_reply(sample_docs[0], sample_docs[1], cfg.rag.doc_topics)
+        for w in guardrails.lint_for_voice(sample_msg, label="clarify_reply (muestra)"):
+            print(f"  ⚠ {w}")
+            lint_warnings += 1
+    print(f"({lint_warnings} warning(s) de lint -- no bloquean, revisar igual)")
+
+    # ---- rag.min_score vigente, sin recalibrar ---------------------------------------------
+    # Solo lo PELIGROSO: una pregunta out_of_domain/no_answer con algún doc cruzando el umbral
+    # (riesgo real de alucinar). Un in_domain/ambiguous que NO cruza ningún doc es un falso
+    # negativo aceptable (abstiene, no inventa) -- no cuenta como peligroso, mismo criterio que
+    # canonical.threshold arriba y que sweep_min_score/pick_best_min_score (ver README).
+    questions = yaml.safe_load(questions_path.read_text(encoding="utf-8"))
+    dangerous_rag = []
+    misses_rag = 0
+    for q in questions:
+        hits = retriever.score_candidates(q["question"])
+        docs_over = {h.source for h in hits if h.score >= cfg.rag.min_score}
+        if q["label"] in ("out_of_domain", "no_answer"):
+            if docs_over:
+                dangerous_rag.append((q["question"], q["label"], sorted(docs_over)))
+        elif not docs_over:
+            misses_rag += 1
+    print(f"\n## rag.min_score vigente ({cfg.rag.min_score:.3f}) contra {questions_path.name}\n")
+    if dangerous_rag:
+        ok = False
+        print(f"❌ {len(dangerous_rag)} caso(s) PELIGROSOS con el umbral vigente:")
+        for q, label, docs in dangerous_rag:
+            print(f"   - {q!r} ({label}): cruza min_score con {docs} (no debería)")
+    else:
+        print(f"✅ 0 casos peligrosos ({misses_rag} falso(s) negativo(s) -- aceptable, abstiene, ver README)")
+
+    # ---- canonical.threshold vigente, sin recalibrar ---------------------------------------
+    if cfg.canonical.enabled and canonical_questions_path.exists() and canonical is not None:
+        canon_questions = yaml.safe_load(canonical_questions_path.read_text(encoding="utf-8")) or []
+        dangerous_canon = []  # solo lo PELIGROSO (ver sweep_canonical_threshold): matchear la
+        # entrada equivocada, o matchear algo en una pregunta 'no_match'. Un 'match' que NO
+        # matcheó nada (falso negativo) es aceptable por diseño (precisión > recall, ver README)
+        # -- NO cuenta como caso peligroso acá, sería un chequeo más estricto que lo que se calibró.
+        misses = 0
+        for q in canon_questions:
+            best = canonical.best_score(q["question"])
+            predicted = best is not None and best[1] >= cfg.canonical.threshold
+            if q["label"] == "match":
+                if predicted and best[0] != q.get("entry_id"):
+                    dangerous_canon.append((q["question"], "match", f"matcheó '{best[0]}' en vez de '{q.get('entry_id')}'"))
+                elif not predicted:
+                    misses += 1
+            else:
+                if predicted:
+                    dangerous_canon.append((q["question"], "no_match", f"matcheó '{best[0]}' (no debería matchear nada)"))
+        print(f"\n## canonical.threshold vigente ({cfg.canonical.threshold:.3f}) contra {canonical_questions_path.name}\n")
+        if dangerous_canon:
+            ok = False
+            print(f"❌ {len(dangerous_canon)} caso(s) PELIGROSOS con el umbral vigente:")
+            for q, label, why in dangerous_canon:
+                print(f"   - {q!r} ({label}): {why}")
+        else:
+            print(f"✅ 0 casos peligrosos ({misses} falso(s) negativo(s) -- aceptable, cae al RAG, ver README)")
+
+    return ok
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default="tests/calibration_questions.yaml")
@@ -219,9 +310,16 @@ def main() -> None:
     ap.add_argument("--out", default="calibration.toml")
     ap.add_argument("--recall-n", type=int, default=5, help="tamaño del top-n denso para el reporte de recall@n")
     ap.add_argument("--dry-run", action="store_true", help="solo mostrar el reporte, no escribir el archivo")
+    ap.add_argument("--check", action="store_true", help="no recalibra -- valida los umbrales vigentes + lint, exit code != 0 si falla")
     args = ap.parse_args()
 
     cfg = load_config()
+
+    if args.check:
+        ok = run_check(cfg, ROOT / args.questions, ROOT / args.canonical_questions)
+        print(f"\n{'✅ calibrate.py --check: OK' if ok else '❌ calibrate.py --check: FALLÓ'}")
+        sys.exit(0 if ok else 1)
+
     print("Cargando retriever (embeddings + reranker)…", flush=True)
     retriever = Retriever(cfg.rag)
 

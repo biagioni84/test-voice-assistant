@@ -966,6 +966,266 @@ LLM. `StreamingSpeaker.synth_ms` (nuevo) guarda el tiempo de síntesis por frase
 sola) en vez de ~1.58s (las dos oraciones juntas) -- mejora real, aunque la reducción total depende
 del largo de cada oración individual, no es gratis para mensajes con una primera oración larga.
 
+## Cierre de etapa (23/09): congelamos el desarrollo sobre documentos de prueba
+
+A partir de acá, los próximos saltos de valor (documentos reales, preguntas de gente de la
+empresa, sesiones con usuarios, corrida en la Orin) no dependen de más código. Esta sección
+documenta el estado del proyecto al cerrar esta etapa: verificable automáticamente, con el
+recorrido de un turno documentado de punta a punta, y con un procedimiento claro para incorporar
+contenido real. No se agregó funcionalidad nueva ni se tocó ningún parámetro/umbral -- lo de acá
+es instrumentación (para poder medir), aserciones (para poder verificar) y documentación.
+
+### Latencia verificada
+
+La prueba en vivo que motivó el rediseño del gate de ambigüedad (sección de arriba) reportaba
+**3.47s** de fin de voz a primer audio para "¿La oficina abre los martes?", con ~2s sin explicar.
+Ese ~2s ya se explicó y arregló en su momento (Piper sintetizando el mensaje completo antes de
+hablar, en vez de por oración). Esta vuelta se verificó que **no queda nada más sin explicar**, en
+las 4 rutas posibles de un turno, agregando instrumentación que faltaba (sin cambiar nada del
+comportamiento):
+
+- `Turn.t_canonical` -- antes invisible: la llamada a `canonical.match()` corre por CADA
+  sub-pregunta, matchee o no (es un reranker cross-encoder, no es gratis: ~520-580ms medidos acá).
+  Se paga siempre, incluso en preguntas que van a terminar en RAG puro.
+- La llamada de traza a `score_candidates()` (para tener el top-2 cuando `hits` trae menos de 2)
+  ahora se cuenta dentro de `turn.t_rag` -- antes quedaba fuera de cualquier timer, como si fuera
+  gratis.
+- `Turn.t_llm_first_sentence` -- distingue "1er TOKEN generado" (`t_llm_first_token`) de "1ra
+  ORACIÓN completa" (`t_llm_first_sentence`): el TTS no puede arrancar hasta que
+  `tts.iter_sentences()` junta una oración entera, así que para una primera oración larga el
+  segundo puede ser bastante mayor que el primero. Antes esto se perdía en un salto sin explicar
+  entre `t_llm_first_token` y `t_first_audio`.
+- Warm-up de Piper agregado en `Assistant.__init__` (una síntesis descartable de "Prueba." al
+  arrancar, igual que ya se hacía con Whisper): la primera síntesis real medía ~18.6ms por cada
+  1000 muestras de audio contra ~12-15ms en las siguientes (ONNX Runtime elige algoritmo/arma
+  buffers internos la primera vez) -- un efecto real pero chico, no explica una latencia de
+  segundos por sí solo. Ahora se paga en el arranque, no en la primera respuesta del usuario.
+
+Con esto, las 4 rutas quedan **100% explicadas** (diferencia entre la suma de los timers y
+`t_first_audio` medida en 0-1ms, ruido de reloj):
+
+| Ruta | canonical | rag | llm 1ra oración | llm total | tts 1ra frase | **fin de voz → 1er audio** |
+|---|---|---|---|---|---|---|
+| Canónica ("¿A qué se dedica la empresa?") | 521ms | 0ms | -- | -- | 1164ms | **1.68s** |
+| RAG + LLM ("Olvidé mi contraseña") | 561ms | 878ms | 930ms | 1872ms | 1349ms | **3.72s** |
+| Abstención (fuera de dominio) | 577ms | 805ms | -- | -- | 697ms | **2.08s** |
+| Aclaración (sintético, ver nota) | -- | -- | -- | -- | 1230ms | **1.23s** |
+
+Notas sobre la tabla:
+- **Canónica** y **abstención** no pasan por el LLM de respuesta (texto fijo o nota fija --
+  `_fixed_reply`), por eso no tienen columnas de LLM.
+- **Aclaración**: la fila mide el mensaje de `clarify_reply()` synthesizado solo, para aislar el
+  costo de TTS de un mensaje de 2 oraciones. En un turno real, `canonical.match()` y el RAG corren
+  ANTES de llegar al gate (es el gate el que decide pedir aclaración), así que el costo real de un
+  turno de aclaración de punta a punta es más parecido a canonical + rag + este número (~2.6s), no
+  a 1.23s solo.
+- El caso original ("¿La oficina abre los martes?" con 3.47s) **ya no reproduce el camino de
+  aclaración** con la calibración actual: tras el rediseño del gate, ese top-1 domina con
+  confianza y el turno sigue por RAG + LLM (fila 2), no por el mensaje fijo de aclaración. No fue
+  posible remedir exactamente esa traza original por ese motivo -- lo que se verificó en su lugar
+  es que las 4 rutas posibles hoy están completamente explicadas.
+- `canonical.match()` corriendo siempre, aunque la pregunta termine yendo a RAG, es un costo
+  evitable (podría saltarse con un filtro léxico barato antes del reranker, o correr en paralelo
+  con el primer paso del RAG) -- **no se optimizó acá** (fuera de alcance de esta etapa: "no
+  ajustar funcionalidad"), queda anotado como oportunidad futura en limitaciones.
+
+### Harness 100% automático
+
+Hasta ahora, varios casos de `tests/eval_questions.yaml` dependían de que una persona (o Claude)
+leyera el reporte en Markdown y juzgara si la respuesta era razonable. Se convirtieron todos los
+casos que se pueden verificar programáticamente a aserciones con exit code ≠ 0, priorizando
+seguridad primero. Ver `scripts/eval.py` (funciones `_check_cjk`, `_check_content_expectations`,
+`_check_canonical_expectations`, `_check_gate_expectations`) y los campos `expect_*` de cada caso
+en `tests/eval_questions.yaml`.
+
+Campos de aserción disponibles (todos opcionales, se combinan según lo que tenga sentido para el
+caso):
+
+| Campo | Qué verifica |
+|---|---|
+| `expect_abstain` | La respuesta es textualmente una de las 3 frases fijas de `abstain_reply()`/`abstain_partial_reply()` (SEGURIDAD: fuera de dominio, sin datos inventados) |
+| `expect_contains` / `expect_not_contains` | Substring (case-insensitive) presente/ausente en la respuesta del último turno |
+| `expect_not_contains_any_turn` | Substring ausente en TODOS los turnos de la conversación (identidad inventada, fuga de contexto) |
+| `expect_contains_each_turn` | Lista de listas, una por turno; `[]` en un turno = sin chequeo ese turno (deja explícito qué no se verifica y por qué, en vez de omitir el campo en silencio) |
+| `expect_doc` | El/los documento(s) en `context_hits` coinciden exactamente con lo esperado (retrieval acertó el documento, no solo "no abstuvo") |
+| `expect_same_as_previous` | Igual texto que el turno anterior ("repetí"); nota: a temperature=0 puede haber no-determinismo chico por batching de GPU, documentado en el caso |
+| `expect_clarify` / `expect_context_restricted_to` | Resultado del gate de ambigüedad: pidió aclaración, o restringió el CONTEXTO a un documento |
+| `expect_canonical_entries` | Qué entrada canónica (o `null` = ninguna) matcheó cada sub-pregunta |
+| `expect_was_rewritten` | La reescritura/descomposición disparó (o no) |
+| `expect_n_subquestions` | Cantidad de sub-preguntas tras la descomposición |
+| CJK (universal, sin campo) | 0 caracteres CJK en CUALQUIER respuesta o reescritura -- corre siempre, no es opt-in |
+
+Cobertura actual (reportada por `_count_assertions()` al final de cada corrida de
+`scripts/eval.py`): **51 de 52 casos** tienen al menos una aserción automática. El único caso sin
+aserción es `rewrite_referencia_dos_turnos_atras`, documentado en su propio `note:`: la pregunta es
+deliberadamente ambigua entre dos temas igual de válidos (ese es justamente el comportamiento que
+prueba), así que forzar un `expect_contains` sobre uno de los dos elegiría arbitrariamente un
+"ganador" y el chequeo terminaría probando algo que el caso no se propone probar.
+
+Por categoría/split (aprox., ver la salida real de `scripts/eval.py` para el conteo exacto en cada
+corrida):
+- **Seguridad** (abstención fuera de dominio, identidad inventada, 0 CJK): 100% con aserción,
+  todas con `expect_abstain` y/o `expect_not_contains_any_turn` y/o el chequeo CJK universal.
+- **Validación** (holdout, nunca ajustado contra estos casos): 10/10 con aserción.
+- **Desarrollo**: 41/42 (el 1 caso sin cobertura ya descrito arriba).
+
+**Un solo comando** corre todo y devuelve pass/fail por exit code -- `scripts/verify.py`:
+
+```
+python scripts/verify.py
+```
+
+Corre, en orden: (1) `scripts/calibrate.py --check` -- valida los umbrales VIGENTES (`rag.min_score`,
+`canonical.threshold`, ya calibrados en `calibration.toml`) contra los datasets de calibración SIN
+recalibrar ni escribir nada, contando solo casos "peligrosos" (falso positivo con riesgo de
+alucinación) como fallo -- un falso negativo (abstiene de más, o cae al RAG en vez de matchear
+canónica) se reporta pero NO cuenta como fallo, es la filosofía de precisión-sobre-recall de
+siempre, no relajada acá; (2) el lint de voz sobre `doc_topics` y `clarify_reply()`; (3)
+`scripts/eval.py`, la suite completa (52 casos, dev + validación) con todas las aserciones de
+arriba. Exit code 0 solo si los dos pasos terminan en 0. **Documentado como el paso obligatorio
+antes de cada commit** (ver docstring de `scripts/verify.py`).
+
+### Flujo de decisión de un turno
+
+```
+usuario habla
+     │
+     ▼
+STT (faster-whisper)
+     │
+     ▼
+¿"repetí"/"¿cómo?"? ──sí──► repite la ÚLTIMA respuesta tal cual (is_repeat_request) ──► TTS
+     │no
+     ▼
+¿pregunta compuesta? (looks_compound) ──sí──► LLM descompone en 1-3 sub-preguntas
+     │no                                            │ (si no valida: sigue abajo con el original)
+     ▼                                               │
+¿hay historial? O (afirmación-sin-forma-de-pregunta  │
+  Y no es charla social)? (looks_like_statement,      │
+  is_chitchat) ──no──► sigue con la pregunta tal cual │
+     │sí                                              │
+     ▼                                                │
+¿referencia vacía a 2 turnos atrás? (is_empty_reference) ──sí──► resuelve determinista
+     │no                                              │
+     ▼                                                │
+LLM reescribe la pregunta como autónoma ◄──────────────┘
+     │
+     ▼
+┌─────────────────────────── por cada sub-pregunta ───────────────────────────┐
+│                                                                               │
+│  respuestas canónicas (reranker vs. formulaciones) ──match──► texto FIJO     │
+│       │no match                                          (nunca llega al LLM)│
+│       ▼                                                                      │
+│  retrieval híbrido (denso + BM25/RRF) → reranker cross-encoder               │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ¿sin hits Y no es charla social? ──sí──► abstención (texto FIJO)            │
+│       │no                                                                    │
+│       ▼                                                                      │
+│  gate_docs(): ¿top-1 domina con confianza? (score >= min_score+margin)       │
+│       │sí──► CONTEXTO restringido a ESE documento solamente                  │
+│       │no                                                                    │
+│       ▼                                                                      │
+│  ¿2 docs distintos, ninguno con confianza alta, a menos de ambiguity_thr?    │
+│       │sí──► aclaración (texto FIJO, "¿sobre cuál de los dos...?")           │
+│       │no──► CONTEXTO normal (hits tal cual)                                │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+¿alguna sub-pregunta necesitó al LLM de respuesta? ──no──► solo texto fijo (canónicas+notas) ──► TTS
+     │sí
+     ▼
+LLM genera (1 llamada, todas las sub-preguntas resueltas juntas, "Parte N:" si son >1)
+     │
+     ▼
+gramática GBNF anti-CJK (fuerza el vocabulario, no post-proceso) + lint/filtro CJK de red de
+seguridad en tts.clean_for_speech()
+     │
+     ▼
+TTS por oración (Piper, tts.iter_sentences) -- arranca a hablar apenas hay 1 oración completa,
+no espera al mensaje entero
+```
+
+### Por heurística/gate: qué la dispara, qué controla, qué caso la cubre
+
+| Heurística/gate | Dónde | Qué la dispara | Qué hace | Parámetro de config | Caso(s) del harness |
+|---|---|---|---|---|---|
+| `is_repeat_request` | `guardrails.py` | Frases fijas tipo "repetí"/"¿cómo?"/"no te escuché" | Repite la última respuesta tal cual, sin pasar por nada más | -- (lista fija, no calibrada) | (cubierto indirectamente en los casos multi-turno con "repetí") |
+| `is_chitchat` | `guardrails.py` | Frases fijas de charla social reconocida | Evita tratarla como afirmación a reescribir, y como "sin hits" a abstener | -- (lista fija) | `grosero_smalltalk`, `chiste_generico` |
+| `looks_like_statement` | `rewrite.py` | Afirmación sin forma de pregunta ("todos los días abre a las diez") | Dispara la reescritura a pregunta, incluso sin historial | -- (heurística léxica, no calibrada) | `rewrite_afirmacion_primer_turno`, `rewrite_afirmacion_como_confirmacion` |
+| `is_empty_reference` | `rewrite.py` | Referencia vacía apuntando 2 turnos atrás ("¿y el otro?") | Resuelve de forma determinista contra el historial, sin LLM | -- | `rewrite_referencia_dos_turnos_atras` (sin aserción automática, ver arriba) |
+| `looks_compound` | `rewrite.py` | Conectores de pregunta compuesta ("y", "también", etc. con 2 preguntas) | Dispara la descomposición LLM en sub-preguntas independientes | -- | `pregunta_compuesta`, `rewrite_decompose_no_trunca_json`, `validation_compuesta_*` |
+| Reescritor/descomponedor LLM | `rewrite.py` + `llm.py: rewrite_query` | Historial presente, o `looks_like_statement`/`looks_compound` | Reformula como pregunta(s) autónoma(s); si no valida (JSON roto), cae a la pregunta original | `rewrite.history_turns`, `rewrite.max_tokens` | todos los `rewrite_*` |
+| Respuestas canónicas | `canonical.py` | Reranker vs. formulaciones guardadas, por encima de `canonical.threshold` | Responde con texto FIJO (con rotación de variante), sin tocar RAG ni LLM | `canonical.threshold` (calibrado, `calibration.toml`) | `canonical_*`, `validation_compuesta_primer_turno` |
+| Retrieval híbrido | `rag.py` | Siempre que no hubo match canónico | Denso + BM25, fusionados por RRF | `rag.hybrid_enabled`, `rag.bm25_candidates`, `rag.rrf_k` (arquitectura, no calibrado) | todos los casos con `expect_doc` |
+| Reranker cross-encoder | `rag.py` | Sobre los candidatos del retrieval híbrido | Reordena por relevancia fina; ESE score es el que se compara contra `min_score` | `rag.reranker_candidates` | todos los casos con `expect_doc` |
+| Abstención | `guardrails.py: abstain_reply` | Sin hits Y no es charla social | Texto FIJO ("No tengo información sobre eso.", 3 variantes) | `rag.min_score` (calibrado) | `pregunta_sin_contexto`, `identidad_inventada*` |
+| `gate_docs` (restricción) | `guardrails.py` | Top-1 domina con confianza (`score >= min_score + confidence_margin`) | CONTEXTO restringido a ESE documento, descarta otros que cruzaron `min_score` de casualidad | `rag.confidence_margin` (PROVISORIO, sin calibrar) | `ambiguedad_falso_positivo_confianza_alta` |
+| `gate_docs` (aclaración) | `guardrails.py` | Ningún doc con confianza alta Y 2 docs distintos a menos de `ambiguity_threshold` | Mensaje FIJO de aclaración con nombres legibles (`rag.doc_topics`) | `rag.ambiguity_threshold` (calibrado) | `retrieval_ambiguo_dos_docs` (test sintético de `gate_docs()`, ver limitaciones) |
+| Gramática GBNF anti-CJK | `llm.py: CJK_GRAMMAR` | Siempre (restringe el vocabulario del LLM en generación) | Previene que el LLM genere caracteres CJK | -- (arquitectura) | chequeo CJK universal, todos los casos |
+| Lint de voz | `guardrails.py: lint_for_voice` | Al cargar `doc_topics`/respuestas canónicas, y como red de seguridad en `tts.clean_for_speech` | Detecta dígitos, siglas, puntuación doble, markdown, mensajes largos (warning, no bloquea) | -- | corre al arrancar `scripts/eval.py` y `scripts/calibrate.py --check` |
+| TTS por oración | `tts.py: iter_sentences` | Siempre | Arranca a hablar con la 1ra oración completa, no espera el mensaje entero | -- (arquitectura) | medido en "latencia verificada" arriba |
+
+### Arquitectura estable vs. parámetros provisionales vs. limitaciones conocidas
+
+**Arquitectura estable** (no depende de los documentos de prueba, no debería cambiar al incorporar
+contenido real): el pipeline completo de la sección anterior, retrieval híbrido (RRF con
+`rrf_k=60`, la constante estándar del paper, no calibrada contra estos docs), el reranker
+cross-encoder, la gramática GBNF anti-CJK, el lint de voz, TTS por oración, el diseño de 3 vías del
+gate de ambigüedad (confianza alta / aclaración / normal), la descomposición de compuestas con
+etiquetas "Parte N:", el harness de aserciones automáticas.
+
+**Parámetros PROVISORIOS** (atados a `docs/` de prueba y `tests/canonical_answers.yaml` de
+prueba -- recalibrar con `scripts/calibrate.py` en cuanto haya contenido real, ver
+`ONBOARDING_CONTENIDO.md`): `rag.min_score`, `rag.ambiguity_threshold`, `canonical.threshold`
+(los 3 en `calibration.toml`, generados por `scripts/calibrate.py`); `rag.confidence_margin`
+(distinto de los anteriores: no está calibrado contra datos porque este corpus no tiene todavía un
+caso real de 2 documentos genuinamente en conflicto -- ver limitaciones).
+
+**Limitaciones conocidas:**
+
+1. **La restricción a un documento (`gate_docs`) pierde información complementaria de un segundo
+   documento.** Si la pregunta real necesita datos de 2 documentos a la vez y uno domina con
+   confianza, el otro se descarta aunque tuviera algo útil que agregar -- el diseño asume que
+   "domina con confianza" implica "el otro documento no es relevante", que es la mayoría de los
+   casos pero no todos.
+2. **El reescritor está cerca del límite de lo que los few-shots pueden lograr confiablemente para
+   un modelo de 3B.** Ya se observaron casos donde omite una palabra clave de la pregunta original
+   (`rewrite_afirmacion_como_confirmacion`, "wifi" se pierde a veces) o formatea números de forma
+   inconsistente (dígitos vs. escritos, ver `validation_compuesta_primer_turno`).
+3. **`recall@5` no tiene todavía evidencia con documentos reales** -- el corpus de prueba
+   (`docs/`, 3 archivos, 14 chunks) es mínimo a propósito, no representa la escala ni la
+   ambigüedad léxica de contenido real de una empresa.
+4. **El gate de aclaración (`gate_docs`, camino "clarify") está verificado solo con datos
+   sintéticos.** Este corpus no tiene un caso real de 2 documentos genuinamente en conflicto (con
+   la calibración actual, ninguna de las 3 variantes de `retrieval_ambiguo_dos_docs` llega siquiera
+   a la comparación de 2 documentos -- solo un documento cruza `min_score`). `confidence_margin`
+   nunca se calibró contra datos por el mismo motivo.
+5. **Las latencias de este README se midieron en la RTX 3050 4GB de esta máquina, no en el target
+   final (Jetson Orin).** Ver `DEPLOY_ORIN.md` para el plan de primera corrida y comparación.
+6. **(nuevo, encontrado esta vuelta) Bug de extracción reproducible en preguntas compuestas**
+   (`validation_compuesta_followup`): en 3/3 repeticiones, la sub-pregunta sobre días de vacaciones
+   devuelve "no se menciona en el contexto dado" aunque el CONTEXTO de esa parte específica sí
+   contiene el dato ("veinte días hábiles de vacaciones por año") -- confirmado llamando
+   directamente a `stream_answer_multi()` con el contexto armado a mano, sin pasar por retrieval ni
+   parsing. Es un modo de falla NUEVO y distinto del que motivó originalmente el etiquetado "Parte
+   N:" (aquella vez el LLM mezclaba/ignoraba partes; acá extrae de menos, no de más). No se
+   resolvió esta vuelta (violaría "no ajustar funcionalidad") -- queda documentado en el caso y
+   como candidato directo para el experimento 3B-vs-7-8B (`DEPLOY_ORIN.md`).
+7. **`canonical.match()` corre siempre, incluso en preguntas que terminan en RAG puro** (ver
+   "latencia verificada" arriba) -- costo evitable no optimizado esta vuelta.
+
+### Contenido real
+
+Ver **`ONBOARDING_CONTENIDO.md`** (checklist completo para incorporar documentos reales,
+respuestas canónicas, `doc_topics` y preguntas de calibración/validación escritas por gente de la
+empresa) y **`DEPLOY_ORIN.md`** (checklist de migración a la Jetson Orin). Los dos viven en la raíz
+del repo, no en `docs/`: `docs/` es el directorio que indexa el RAG (`rag.docs_dir`), así que
+ponerlos ahí los mete como contenido indexado por error (encontrado en la práctica: `docs/`
+pasó de 14 a 71 chunks al escribirlos ahí la primera vez) -- moverlos a la raíz evita eso sin tocar
+`rag.docs_dir`, que sería un cambio de parámetro fuera de alcance de esta etapa.
+
 ## Estructura
 
 ```

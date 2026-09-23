@@ -42,8 +42,10 @@ class Turn:
     was_repeat: bool = False  # True si este turno fue un pedido de "repetí" (ver guardrails.is_repeat_request)
     t_stt: float = 0.0
     t_rewrite: float = 0.0
+    t_canonical: float = 0.0     # suma de todas las llamadas a canonical.match() del turno (matcheen o no)
     t_rag: float = 0.0
     t_llm_first_token: float = 0.0
+    t_llm_first_sentence: float = 0.0  # 1er TOKEN != 1ra ORACIÓN completa -- TTS espera la oración
     t_llm_total: float = 0.0
     n_tokens: int = 0
     t_tts_total: float = 0.0     # suma de todo lo que tardó Piper en sintetizar (todas las frases)
@@ -72,6 +74,12 @@ class Assistant:
         self.llm = LocalLLM(cfg.llm, cfg.rewrite)
         log(f"LLM listo ({time.monotonic() - t:.1f}s)")
         self.tts = PiperTTS(cfg.tts)
+        # como con Whisper arriba: la primera síntesis de Piper es un poco más lenta (ONNX runtime
+        # elige el algoritmo/arma buffers internos la primera vez) -- medido (24/09, ver README):
+        # ~18.6ms por cada 1000 muestras de audio en la primera llamada vs. ~12-15ms en las
+        # siguientes, un efecto real pero chico (no explica por sí solo una latencia de segundos,
+        # ver README "latencia verificada"). Se paga acá, no en la primera respuesta real.
+        self.tts.synth("Prueba.")
         self.speaker = Speaker(cfg.audio.speaker_name) if speak else None
         self.vad = UtteranceRecorder(cfg.vad, cfg.audio.sample_rate)
         self.wake = WakeWord(cfg.wakeword) if cfg.wakeword.enabled else None
@@ -157,7 +165,9 @@ class Assistant:
         all_hits = []
         for subq in subquestions:
             if self.canonical:
+                t = time.monotonic()
                 match = self.canonical.match(subq)
+                turn.t_canonical += time.monotonic() - t
                 if match:
                     canonical_parts.append(match.text)
                     turn.canonical_matches.append({
@@ -188,7 +198,9 @@ class Assistant:
                 if len(hits) >= 2:
                     top1, top2 = hits[0], hits[1]
                 else:
+                    t = time.monotonic()
                     cands = self.rag.score_candidates(subq)
+                    turn.t_rag += time.monotonic() - t  # llamada extra solo para la traza -- real, se cuenta
                     top1 = cands[0] if cands else None
                     top2 = cands[1] if len(cands) > 1 else None
                 turn.retrieval_trace.append({
@@ -262,6 +274,13 @@ class Assistant:
         multi_part = len(resolved) > 1
         spoken: list[str] = []
         for sentence in iter_sentences(counted()):
+            if turn.t_llm_first_sentence == 0.0:
+                # BUG de medición encontrado (24/09, ver README "latencia verificada"): "1er token"
+                # no es lo mismo que "1ra oración completa" -- TTS no puede arrancar hasta que
+                # iter_sentences() junta una oración entera, así que para una primera oración larga
+                # esto puede tardar mucho más que el 1er token. Antes esto quedaba invisible
+                # (aparecía como un salto sin explicar entre t_llm_first_token y t_first_audio).
+                turn.t_llm_first_sentence = time.monotonic() - t_llm
             if multi_part:
                 sentence = strip_part_labels(sentence)
                 if not sentence:
@@ -298,8 +317,10 @@ class Assistant:
     def print_metrics(self, t: Turn) -> None:
         tps = t.n_tokens / t.t_llm_total if t.t_llm_total else 0
         print(
-            f"   ⏱ stt {t.t_stt:.2f}s | rewrite {t.t_rewrite * 1000:.0f}ms | rag {t.t_rag * 1000:.0f}ms | "
-            f"llm 1er token {t.t_llm_first_token:.2f}s, {t.n_tokens} tok @ {tps:.1f} tok/s | "
+            f"   ⏱ stt {t.t_stt:.2f}s | rewrite {t.t_rewrite * 1000:.0f}ms | canonical {t.t_canonical * 1000:.0f}ms | "
+            f"rag {t.t_rag * 1000:.0f}ms | "
+            f"llm 1er token {t.t_llm_first_token:.2f}s, 1ra oración {t.t_llm_first_sentence:.2f}s, "
+            f"{t.n_tokens} tok @ {tps:.1f} tok/s | "
             f"tts total {t.t_tts_total * 1000:.0f}ms (1ra frase {t.t_tts_first * 1000:.0f}ms) | "
             f"fin de voz → 1er audio {t.t_first_audio:.2f}s",
             flush=True,

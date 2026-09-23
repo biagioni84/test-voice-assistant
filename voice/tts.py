@@ -47,8 +47,8 @@ _EMOJI = re.compile(
 
 def clean_for_speech(text: str) -> str:
     """Quita markdown, emojis y caracteres CJK que Piper leería mal. Lo de CJK es una red de
-    seguridad: el logit_bias en voice/llm.py ya debería prevenir que el LLM los genere (ver
-    voice/guardrails.py y README), esto es por si algo igual se escapa."""
+    seguridad: la gramática GBNF en voice/llm.py (CJK_GRAMMAR) ya debería prevenir que el LLM los
+    genere (ver voice/guardrails.py y README), esto es por si algo igual se escapa."""
     text = _EMOJI.sub("", text)
     text = CJK_RE.sub("", text)
     text = re.sub(r"[*_#`>~|]+", "", text)
