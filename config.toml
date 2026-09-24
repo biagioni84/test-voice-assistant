@@ -103,13 +103,25 @@ server_port = 8811
 # El LLM de respuesta YA NO recibe el historial de la charla (ver [rewrite] y voice/rewrite.py): recibe
 # la pregunta ya reescrita como autónoma + el CONTEXTO de este turno, nada más. Antes el system_prompt
 # tenía una regla de "priorizá el CONTEXTO sobre lo que dijiste antes" -- ya no aplica, no hay "antes".
+# Instrucción de sí/no + dato concreto (25/09, ver README "cambio_de_dia_en_followup"): bug real
+# encontrado -- cuando el reescritor arma una pregunta de sí/no ("¿La oficina abre los sábados?" en
+# vez de "¿A qué hora abre...?"), el LLM contestaba "Sí, la oficina abre los sábados." sin el dato
+# (la hora) que sí estaba en el CONTEXTO -- técnicamente correcto, inútil para el usuario. No se tocó
+# el reescritor (ver README "orden de los few-shots es crítico" y el bug de sesgo hacia el último
+# ejemplo, riesgo real de tocar ESE prompt de nuevo); se corrige del lado de la respuesta, que ya
+# tiene el CONTEXTO completo sea cual sea el tipo de la pregunta.
 system_prompt = """Eres un asistente de voz local. Respondés siempre en español, en 1 a 3 frases cortas y naturales, como si hablaras en voz alta.
 No uses markdown, listas, emojis ni símbolos. Escribí los números y unidades como se pronuncian.
 La pregunta que recibís ya viene formulada como autónoma, sin depender de una charla previa.
 Antes de usar el CONTEXTO, fijate si realmente tiene que ver con la pregunta. Si tiene que ver, úsalo
 para responder y no inventes datos (horarios, precios, nombres) que no estén ahí; si no contiene la
 respuesta, decilo con honestidad. Si el CONTEXTO no tiene que ver con la pregunta, ignoralo por
-completo y respondé como asistente general, sin forzarlo ni mencionarlo."""
+completo y respondé como asistente general, sin forzarlo ni mencionarlo.
+Si la pregunta es de sí o no, no te quedes solo en "sí" o "no": agregá en la misma frase el dato
+concreto del CONTEXTO que lo sustenta (el horario, el lugar, la condición). Si la respuesta es
+negativa y el CONTEXTO tiene la alternativa correcta (por ejemplo, cuándo sí corresponde), agregala
+también. Nunca inventes un dato que no esté en el CONTEXTO solo para completar la frase -- si no
+está ahí, contestá sí o no nomás, con honestidad."""
 
 [rewrite]
 # Reescribe la pregunta en una autónoma ANTES del retrieval (reemplaza al viejo fallback de

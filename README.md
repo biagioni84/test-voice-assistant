@@ -1193,7 +1193,13 @@ caso real de 2 documentos genuinamente en conflicto -- ver limitaciones).
 2. **El reescritor está cerca del límite de lo que los few-shots pueden lograr confiablemente para
    un modelo de 3B.** Ya se observaron casos donde omite una palabra clave de la pregunta original
    (`rewrite_afirmacion_como_confirmacion`, "wifi" se pierde a veces) o formatea números de forma
-   inconsistente (dígitos vs. escritos, ver `validation_compuesta_primer_turno`).
+   inconsistente (dígitos vs. escritos, ver `validation_compuesta_primer_turno`). Confirmado con más
+   evidencia (25/09, ver sección "Sujeto omitido y sí/no + dato concreto"): **el ORDEN de los
+   few-shots es crítico, no cosmético** -- un ejemplo puesto al final de la lista actúa como el
+   patrón "más fresco" y el 3B lo copia literalmente ante entradas nuevas sin relación clara
+   (recency bias, visto 2 veces con pares de ejemplos distintos). Además, `validation_dale_y_el_otro`
+   queda documentado como un bug determinista sin arreglar: el reescritor resuelve un follow-up vago
+   al día equivocado de forma 100% reproducible.
 3. **`recall@5` no tiene todavía evidencia con documentos reales** -- el corpus de prueba
    (`docs/`, 3 archivos, 14 chunks) es mínimo a propósito, no representa la escala ni la
    ambigüedad léxica de contenido real de una empresa.
@@ -1225,6 +1231,104 @@ del repo, no en `docs/`: `docs/` es el directorio que indexa el RAG (`rag.docs_d
 ponerlos ahí los mete como contenido indexado por error (encontrado en la práctica: `docs/`
 pasó de 14 a 71 chunks al escribirlos ahí la primera vez) -- moverlos a la raíz evita eso sin tocar
 `rag.docs_dir`, que sería un cambio de parámetro fuera de alcance de esta etapa.
+
+## Sujeto omitido y sí/no + dato concreto (25/09): dos bugs reales del reescritor
+
+Prueba en vivo: **"¿A qué hora abre el martes?"** abstenía. Antes de tocar nada, se probó la
+hipótesis con una traza directa (sin cambiar código):
+
+| Variante | top1 (oficina.md) | ¿supera `min_score=-0.68`? |
+|---|---|---|
+| "¿A qué hora abre **el martes**?" | -1.14 | ❌ No |
+| "¿A qué hora abre **la oficina** el martes?" | +0.04 | ✅ Sí |
+| "¿A qué hora abre la oficina?" | +1.12 | ✅ Sí |
+
+Confirmado: el sujeto omitido es la causa (agregar "martes" solo cuesta ~1 punto de score, no
+~1.8). La pregunta ya viene con "?" -- ningún filtro barato (`looks_like_statement`,
+`looks_compound`) la agarraba, y sin historial no había de dónde completar "la oficina": el
+reescritor se saltaba por completo.
+
+**Fix**: `rewrite.default_subject` (config, no hardcodeado) + una instrucción y 2 few-shots en el
+prompt del reescritor (completar sujeto ausente / NO reemplazar uno ya explícito, con contraejemplo
+"¿A qué se dedica Juan?"). El reescritor ahora corre siempre, salvo charla social reconocida --
+antes se saltaba para preguntas de primer turno ya bien formadas.
+
+**Bug de recency bias, encontrado al agregar los 2 few-shots nuevos**: puestos al FINAL de la
+lista, el 3B empezó a copiar literalmente la respuesta del ÚLTIMO few-shot ("¿A qué se dedica
+Juan?") ante cualquier entrada nueva sin relación -- `rewrite_afirmacion_primer_turno` ("El
+estacionamiento tiene doce lugares.") pasó a devolver textualmente "¿A qué se dedica Juan?". Mismo
+patrón ya documentado para el ejemplo "sala Norte" más arriba en este archivo, ahora confirmado por
+segunda vez con otro par de ejemplos. **El orden de los few-shots es crítico, no cosmético**: el
+ÚLTIMO few-shot de la lista actúa como el patrón "más fresco" para entradas nuevas sin relación
+clara con ningún ejemplo -- por eso el último de `voice/rewrite.py: _EXAMPLES` tiene que seguir
+siendo el caso de afirmación aislada de primer turno ("las vacaciones se piden con..."), y los 2
+nuevos de sujeto omitido van a mitad de lista, no al final. Corregido reordenando; verificado que
+`rewrite_afirmacion_primer_turno` vuelve a pasar.
+
+**Latencia -- investigado y descartado como problema**: el costo por-llamada subió de ~514ms a
+~550-580ms de mediana al agregar los 2 few-shots (creciendo el prefijo estático de ~1142 a ~1362
+tokens). Medido directo con el campo `timings` de llama-server, comparando la misma llamada con el
+prefijo viejo y el nuevo: `cache_n` coincide EXACTAMENTE con el tamaño del prefijo estático en
+ambos casos (el cacheo de prefijo sigue funcionando, no se invalida), `prompt_ms` en tibio se
+mantiene en ~110-115ms en los dos, y el costo por token generado (`predicted_per_token_ms`) tampoco
+cambia (~24-29ms/token en ambos) -- el prefijo más largo no se reprocesa gracias al cache, y la
+atención sobre un KV cache más grande no midió un costo extra detectable a esta escala. La suba
+observada en el agregado de la suite es la fracción de turnos que ahora PAGAN el reescritor (subió
+de ~42% a ~85%, ver "Cierre de etapa" arriba), no un cambio en el costo por-llamada.
+
+**Segundo bug real, encontrado al verificar `cambio_de_dia_en_followup`**: dos de sus cinco
+variantes fallaban de forma DETERMINISTA (no nodeterminismo de GPU, reproduce igual con el código
+sin el fix de sujeto omitido) -- el reescritor a veces resuelve un follow-up corto ("¿Y los
+sábados?", después de una respuesta CERRADA sin hora como "La oficina no abre el domingo.") como
+pregunta de SÍ/NO ("¿La oficina abre los sábados?") en vez de qué-hora, y el LLM de respuesta
+contestaba "Sí, la oficina abre los sábados." -- técnicamente correcto, sin la hora, inútil para
+el usuario. Documentado que el bug es más específico de lo que parecía: con un historial "limpio"
+(pregunta qué-hora + respuesta CON la hora, ver `rewrite_elipsis_hereda_tipo_que_hora`), la elipsis
+SÍ hereda el tipo qué-hora de forma confiable.
+
+**Fix, del lado de la RESPUESTA en vez del reescritor** (evita tocar de nuevo un prompt ya cerca
+del límite de pocos ejemplos, ver arriba): se agregó una instrucción al `system_prompt` del LLM de
+respuesta (`config.toml [llm]`) -- si la pregunta es de sí o no, agregar en la misma frase el dato
+concreto del CONTEXTO que lo sustenta (el horario, el lugar, la condición); si la respuesta es
+negativa y el CONTEXTO tiene la alternativa correcta, agregarla también; nunca inventar un dato que
+no esté en el CONTEXTO. Con este único agregado (sin few-shots nuevos), las 5 variantes de
+`cambio_de_dia_en_followup` pasan de forma estable ("Sí, la oficina abre los sábados de diez a
+una."), y un caso positivo nuevo (`si_no_negativo_con_alternativa`) confirma el camino negativo+
+alternativa ("No, la sala Norte solo se puede reservar por dos horas seguidas."). Regresión
+verificada explícitamente: `si_no_sin_dato_no_inventa` ("¿La oficina tiene gimnasio?", sin ningún
+doc relevante) sigue absteniendo limpio, sin inventar un dato para completar la frase.
+
+**Efecto colateral del cambio de `system_prompt`, honesto de reportar**: al agregar la instrucción
+de sí/no, 3 casos que antes pasaban limpio empezaron a fallar por el mismo motivo de siempre
+(dato correcto, palabra específica distinta -- `comentario_sin_tema_no_corta_continuidad`,
+`validation_compuesta_imperativa`, `validation_sujeto_elidido_y_afirmacion` turno 2). Ningún caso
+tenía un dato INCORRECTO -- las 3 aserciones se corrigieron para verificar el dato (p.ej. "diez")
+en vez de la palabra ("sábado"/"oficina"), mismo criterio que ya se venía aplicando. Confirma que
+cualquier cambio al `system_prompt`, por acotado que sea, tiene efectos no locales sobre un modelo
+de 3B ya cerca de su límite de instrucciones -- ver limitaciones.
+
+**Caso identificado como bug real, no arreglado esta vuelta**: `validation_dale_y_el_otro`
+("dale, ¿y el otro día que te dije?", tras solo mencionar el domingo) resuelve consistentemente al
+día EQUIVOCADO (domingo) -- 5/5 repeticiones, 100% determinista, confirmado también contra el
+código sin el fix de sujeto omitido. El fix de sí/no + dato concreto no lo toca (la pregunta
+reescrita apunta al día equivocado desde el principio, no hay dato de sábado que agregar). Es
+holdout -- no se fuerza con un few-shot calcado de este caso puntual. Se dejó SIN aserción
+automática a propósito (mismo criterio que `rewrite_referencia_dos_turnos_atras`): forzar
+`expect_contains: ["sábado"]` pondría la suite en rojo por un bug ya conocido, no por una
+regresión nueva. Candidato directo para el experimento 3B vs 7-8B (`DEPLOY_ORIN.md`).
+
+**Casos flaky: true (política, actualmente sin uso)**: `scripts/eval.py: run_case_flaky()`
+implementa una política explícita para casos genuinamente no-deterministas (GPU batching a
+temperature=0): reintenta hasta 3 veces, pasa si al menos 2 de 3 intentos pasan todos sus chequeos;
+los intentos fallidos que terminan en veredicto de pase no cuentan para el exit code, pero se
+reportan igual en una sección aparte ("Casos marcados flaky: true"), nunca escondidos. Los dos
+casos que originalmente parecían candidatos (`cambio_de_dia_en_followup`, `validation_dale_y_el_otro`)
+resultaron, tras investigar, ser bugs deterministas (arreglado uno, documentado el otro), no
+nodeterminismo real -- por eso hoy `flaky: true` no está en uso por ningún caso. Se deja la
+infraestructura (probada, funcionando) para el día que aparezca un caso genuinamente flaky, en vez
+de reintroducir esto desde cero -- pero **no es una licencia para bajar el estándar de un caso**:
+antes de marcar algo `flaky: true`, hay que confirmar que el mismo turno da resultados DISTINTOS
+entre intentos (no solo que falla siempre), como se hizo acá.
 
 ## Estructura
 

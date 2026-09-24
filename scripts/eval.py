@@ -39,6 +39,7 @@ canonical_check_failures: list[str] = []  # casos con expect_canonical_*/expect_
 gate_check_failures: list[str] = []  # casos con expect_clarify/expect_context_restricted_to que no dieron lo esperado
 content_check_failures: list[str] = []  # casos con expect_contains/expect_not_contains/expect_abstain/etc
 cjk_check_failures: list[str] = []  # CUALQUIER turno (o salida de reescritura) con caracteres CJK -- chequeo universal, sin campo
+flaky_case_reports: list[str] = []  # veredicto de cada caso flaky: true (ver run_case_flaky) -- sección aparte, no cuenta para el exit code si pasa
 
 # Plantillas fijas de voice/guardrails.py: abstain_reply() -- para expect_abstain. Comparación
 # exacta a propósito: son texto FIJO, no generado, así que no hay variación legítima que tolerar.
@@ -195,6 +196,67 @@ def run_case(bot: Assistant, case: dict, label: str | None, turns: list[str], sh
     lines += _check_content_expectations(case, turn_results)
     lines.append("")
     return lines
+
+
+_FLAKY_RETRIES = 3
+_FLAKY_MIN_PASS = 2
+
+
+def run_case_flaky(bot: Assistant, case: dict, label: str | None, turns: list[str], show_chunk_text: bool) -> list[str]:
+    """Para casos con `flaky: true` (25/09, ver README "reescritor: nodeterminismo de GPU"): NO es
+    una licencia genérica para bajar el estándar de ningún caso -- solo para uno que YA se confirmó,
+    con evidencia (comparación contra el código sin el cambio en cuestión, ver commit), que el mismo
+    turno da un resultado distinto entre corridas por varianza de floating-point en el batching de
+    GPU de llama-server, no por un bug de código. Reintenta el caso hasta _FLAKY_RETRIES veces
+    (conversación nueva cada vez, bot.reset_conversation() ya lo hace run_case()); pasa si al menos
+    _FLAKY_MIN_PASS de los intentos pasan TODOS sus chequeos de contenido/gate/canonical -- no exige
+    unanimidad. Los chequeos que NO se tocan (CJK, historial, n_subquestions) siguen siendo
+    invariantes duros: si alguno de esos falla en cualquier intento, no hay reintento que lo tape,
+    porque esta función solo hace rollback de las 3 listas de "contenido" (ver abajo), nunca de las
+    de seguridad/plumbing.
+
+    Los intentos fallidos que terminan en un veredicto de PASE (>=_FLAKY_MIN_PASS) se sacan de las
+    listas globales de fallos -- no deben contar para el exit code de la suite -- pero CADA intento
+    (pase o no) se reporta igual en `flaky_case_reports`, una sección aparte del reporte final: la
+    intermitencia queda visible, no se esconde detrás de un "todo verde" silencioso."""
+    cid = case["id"]
+    tracked = (content_check_failures, gate_check_failures, canonical_check_failures)
+    attempts: list[tuple[bool, list[str]]] = []  # (pasó_este_intento, nuevas_fallas_de_este_intento)
+    all_lines: list[str] = []
+    for i in range(1, _FLAKY_RETRIES + 1):
+        before = [len(lst) for lst in tracked]
+        attempt_label = f"{label + ' -- ' if label else ''}intento {i}/{_FLAKY_RETRIES}"
+        lines = run_case(bot, case, attempt_label, turns, show_chunk_text)
+        new_failures: list[str] = []
+        for lst, n_before in zip(tracked, before):
+            new_failures += lst[n_before:]
+            del lst[n_before:]  # rollback -- se re-agrega más abajo SOLO si el veredicto final es fallo
+        passed = not new_failures
+        attempts.append((passed, new_failures))
+        all_lines += lines
+        if sum(1 for ok, _ in attempts if ok) >= _FLAKY_MIN_PASS:
+            break  # ya alcanzó el mínimo -- no hace falta gastar más intentos (ni más latencia)
+
+    n_pass = sum(1 for ok, _ in attempts if ok)
+    n_total = len(attempts)
+    ok = n_pass >= _FLAKY_MIN_PASS
+    verdict = f"{'✅ PASA' if ok else '❌ FALLA'} (marcado flaky: {n_pass}/{n_total} intentos, mínimo {_FLAKY_MIN_PASS})"
+    flaky_case_reports.append(f"- {cid}{f' ({label})' if label else ''}: {verdict}")
+    for i, (passed, new_failures) in enumerate(attempts, 1):
+        if not passed:
+            for f in new_failures:
+                flaky_case_reports.append(f"    - intento {i}/{n_total} falló: {f}")
+    if not ok:
+        # el veredicto final es fallo real (menos de _FLAKY_MIN_PASS intentos pasaron) -- ESTO sí
+        # cuenta para el exit code, con un resumen (no cada línea repetida de cada intento, eso ya
+        # queda en flaky_case_reports arriba).
+        content_check_failures.append(
+            f"{cid}: marcado flaky pero solo {n_pass}/{n_total} intentos pasaron (mínimo {_FLAKY_MIN_PASS}) -- "
+            f"ver sección 'casos inestables' del reporte para el detalle de cada intento"
+        )
+    all_lines.append(f"**Veredicto flaky para {cid}{f' ({label})' if label else ''}:** {verdict}")
+    all_lines.append("")
+    return all_lines
 
 
 def _check_content_expectations(case: dict, turn_results: list) -> list[str]:
@@ -463,6 +525,9 @@ def main() -> None:
         for case in split_cases:
             if case.get("type") == "rewrite":
                 body += run_rewrite_case(bot, case)
+            elif case.get("flaky"):
+                for label, turns in case_variants(case):
+                    body += run_case_flaky(bot, case, label, turns, args.show_chunk_text)
             else:
                 for label, turns in case_variants(case):
                     body += run_case(bot, case, label, turns, args.show_chunk_text)
@@ -533,6 +598,13 @@ def main() -> None:
         f"tienen al menos un chequeo automático ({n_checks['without']} sin ninguno -- ver el reporte "
         f"de más arriba o README para por qué en cada caso)."
     )
+    if flaky_case_reports:
+        # sección APARTE, informativa -- un caso flaky que terminó en PASE (>=2/3 intentos) ya
+        # tuvo sus fallas intermedias sacadas de all_failures de arriba (ver run_case_flaky):
+        # no cuentan para el exit code, pero quedan visibles acá, no escondidas.
+        print("\n**Casos marcados `flaky: true`** (ver README \"reescritor: nodeterminismo de GPU\"):")
+        for line in flaky_case_reports:
+            print(f"   {line}")
     if all_failures:
         if subq_check_failures:
             print(f"\n❌ {len(subq_check_failures)} chequeo(s) de expect_n_subquestions fallaron:")
