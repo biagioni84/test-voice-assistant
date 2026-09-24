@@ -148,6 +148,35 @@
   history: []
   question: "El estacionamiento tiene doce lugares."
 
+- id: rewrite_sujeto_omitido_primer_turno
+  type: rewrite
+  note: >
+    bug real (25/09, ver README "sujeto omitido"): "¿A qué hora abre el martes?" ya viene con "?"
+    (no dispara looks_like_statement) y sin historial no había de dónde completar el sujeto -- antes
+    de esto se saltaba la reescritura por completo y el retrieval fallaba por falta de "la oficina"
+    (traza: sin sujeto -1.14 contra min_score=-0.68), no por "martes" (con sujeto: +0.04). El
+    reescritor ahora corre siempre (salvo charla social) y completa el sujeto omitido con
+    rewrite.default_subject.
+  expect: "¿A qué hora abre la oficina el martes?' o equivalente, con 'oficina' agregado"
+  expect_contains: ["oficina"]
+  expect_was_rewritten: true
+  history: []
+  question: "¿A qué hora abre el martes?"
+
+- id: rewrite_sujeto_explicito_no_reemplaza
+  type: rewrite
+  note: >
+    contracara del caso de arriba, agregado junto con el fix (no después): una pregunta con sujeto
+    YA explícito (una persona, no el negocio) no debe tocarse -- riesgo real si la instrucción de
+    sujeto omitido se generaliza de más ("toda pregunta sin 'la oficina' completa con 'la oficina'"
+    en vez de "solo si el sujeto está genuinamente ausente").
+  expect: "sin cambios, no debe agregar 'la oficina' ni ningún otro sujeto"
+  expect_contains: ["Juan"]
+  expect_not_contains: ["oficina"]
+  expect_was_rewritten: false
+  history: []
+  question: "¿A qué se dedica Juan?"
+
 - id: rewrite_decompose_no_trunca_json
   type: rewrite
   compound: true
@@ -171,6 +200,29 @@
   expect_doc: "oficina.md"
   turns:
     - "¿A qué hora abre la oficina los sábados?"
+
+- id: sujeto_omitido_dia_semana
+  note: >
+    pipeline completo del bug real (25/09, ver README "sujeto omitido" y
+    rewrite_sujeto_omitido_primer_turno): primer turno, sin historial, sujeto omitido -- antes
+    abstenía (retrieval fallaba sin "la oficina" en la pregunta, no por "martes"). Con el reescritor
+    corriendo siempre y completando el sujeto, debe responder el horario de un día de semana.
+  expect: "debe responder que abre a las nueve (horario de lunes a viernes), NO debe abstenerse"
+  expect_contains: ["nueve"]
+  expect_doc: "oficina.md"
+  turns:
+    - "¿A qué hora abre el martes?"
+
+- id: sujeto_explicito_no_reemplazado_pipeline
+  note: >
+    pipeline completo del contraejemplo (ver rewrite_sujeto_explicito_no_reemplaza): si el
+    reescritor le agregara "la oficina" a esta pregunta, el retrieval matchearía oficina.md y
+    respondería con datos de horario que no tienen nada que ver con "Juan" -- SEGURIDAD (evita una
+    respuesta inventada por confundir el sujeto).
+  expect: "debe abstenerse -- ningún documento tiene información sobre 'Juan'"
+  expect_abstain: true
+  turns:
+    - "¿A qué se dedica Juan?"
 
 - id: reset_password
   note: caso de control, pregunta simple con respuesta clara en soporte_tecnico.md

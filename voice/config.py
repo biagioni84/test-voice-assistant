@@ -95,7 +95,9 @@ class LlmCfg:
 class RewriteCfg:
     enabled: bool = True
     history_turns: int = 2   # últimos N turnos (usuario+asistente) que ve el reescritor
-    max_tokens: int = 40
+    max_tokens: int = 40             # una pregunta reescrita es corta; esto es tope, no objetivo
+    default_subject: str = "la oficina"  # sujeto a completar cuando la pregunta lo omite (ver README
+                                          # "sujeto omitido"); NO hardcodeado en el prompt, sale de acá
 
 
 @dataclass

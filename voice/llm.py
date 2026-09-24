@@ -145,15 +145,16 @@ class LocalLLM:
         solo elemento (comportamiento de siempre); trae más de uno solo si voice/rewrite.py:
         looks_compound() disparó Y el reescritor devolvió una descomposición válida.
 
-        Dos casos disparan la reescritura AUNQUE NO HAYA HISTORIAL (a diferencia de la reescritura
-        de seguimiento "clásica", que no tiene sentido sin turno anterior que resolver):
-          - looks_compound(): una pregunta compuesta puede ser la primera frase de la charla.
-          - looks_like_statement(): en voz hablada, una confirmación de sí/no suena como afirmación
-            ("todos los días abre a las diez") y Whisper la transcribe sin "?" -- convertirla a
-            pregunta ayuda al retrieval igual aunque no haya sujeto del historial para completarla
-            (ver voice/rewrite.py: SYSTEM_PROMPT, ejemplo sin historial). Se excluye charla social
-            reconocida (is_chitchat) para no pagar la llamada en comandos/imperativos que no son
-            afirmaciones a convertir ("Contame un chiste.", "Decime la hora.")."""
+        El reescritor general (más abajo) CORRE SIEMPRE, incluso sin historial y con una pregunta
+        ya bien formada de primer turno (25/09, ver README "sujeto omitido") -- bug real: "¿A qué
+        hora abre el martes?" ya viene con "?" (no dispara looks_like_statement) y sin historial de
+        dónde tomar el sujeto omitido ("la oficina"), así que antes se saltaba la reescritura por
+        completo y el retrieval fallaba por falta de sujeto, no por "martes" (confirmado con
+        traza: sin sujeto -1.14, con sujeto +0.04, contra min_score=-0.68). El prompt (SYSTEM_PROMPT)
+        ahora completa ese sujeto con rewrite_cfg.default_subject cuando está genuinamente ausente,
+        sin tocar preguntas que ya nombran un sujeto explícito distinto. Único caso que se sigue
+        salteando: charla social reconocida (is_chitchat) -- no hay nada que completar ahí, sería
+        latencia pura sin beneficio."""
         if not self.rewrite_cfg.enabled:
             return [question], False
 
@@ -166,10 +167,7 @@ class LocalLLM:
             # no validó (JSON roto, etc.) -- sigue el camino normal de abajo con la pregunta tal
             # cual, que todavía puede beneficiarse de la reescritura de seguimiento si hay historial
 
-        needs_rewrite = bool(self.history) or (
-            rewrite.looks_like_statement(question) and not is_chitchat(question)
-        )
-        if not needs_rewrite:
+        if is_chitchat(question):
             return [question], False
 
         if self.history and rewrite.is_empty_reference(question):
@@ -178,8 +176,8 @@ class LocalLLM:
                 return [resolved], True
 
         messages = [
-            {"role": "system", "content": rewrite.SYSTEM_PROMPT},
-            *rewrite.few_shot_messages(),
+            {"role": "system", "content": rewrite.build_system_prompt(self.rewrite_cfg.default_subject)},
+            *rewrite.few_shot_messages(self.rewrite_cfg.default_subject),
             {"role": "user", "content": rewrite.format_input(pairs, question)},
         ]
         # stop=["?", "\n"]: corta la decodificación apenas termina la pregunta reescrita en vez de
@@ -214,8 +212,13 @@ class LocalLLM:
             # reescrituras buenas solo por esta ambigüedad del endpoint.
             out = out + "?"
         # BUG real (23/09): si la entrada era una afirmación (sin "?") y el modelo la devolvió
-        # prácticamente igual, no la convirtió de verdad -- no vale como reescritura.
-        if rewrite.looks_like_statement(question) and rewrite.is_near_identical(out, question):
+        # prácticamente igual, no la convirtió de verdad -- no vale como reescritura. Chequeo
+        # ampliado (25/09, ver README "sujeto omitido") a TODA entrada, no solo afirmaciones: ahora
+        # que el reescritor corre siempre, una pregunta que YA tenía sujeto explícito y que el
+        # modelo correctamente dejó intacta (nada que completar) tampoco debería contar como
+        # "reescrita" -- is_near_identical() sigue distinguiendo "sin cambios" de "se envolvió una
+        # afirmación en ¿...?" (ver su docstring), así que ampliar esto no rompe ese caso.
+        if rewrite.is_near_identical(out, question):
             return [question], False
         if rewrite.looks_like_question(out):
             return [out], True

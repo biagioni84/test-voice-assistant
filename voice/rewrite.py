@@ -38,6 +38,13 @@ de nuevo"), la reescritura es directamente la pregunta anterior completa, tal cu
 abreviada con "eso". Si el usuario corrige algo ("no, te pregunté por el sábado"), la pregunta
 reescrita usa la corrección, no lo que se había hablado antes.
 
+Si la pregunta actual NO menciona ningún sujeto explícito -- ni trae uno propio ("¿A qué hora abre
+el martes?", sin decir qué abre) ni hay historial de dónde tomarlo -- completala con el sujeto por
+defecto de este asistente: "{default_subject}". Esto NO aplica si la pregunta ya nombra un sujeto
+explícito, sea el mismo tema u otro completamente distinto (una persona, un lugar, un tema no
+relacionado): en ese caso dejá el sujeto tal cual lo dijo el usuario, no lo reemplaces por el
+default ni lo agregues igual "por las dudas".
+
 La entrada puede venir como una AFIRMACIÓN en vez de una pregunta: en español hablado, las
 confirmaciones de sí o no suelen sonar como afirmaciones con entonación ("todos los días abre a las
 diez") y llegan transcriptas sin signos de interrogación. Convertí esas afirmaciones en una pregunta
@@ -89,6 +96,26 @@ _EXAMPLES: list[tuple[list[tuple[str, str]], str, str]] = [
         "¿La oficina abre todos los días?",
     ),
     (
+        # sujeto omitido, SIN historial (primer turno) -- bug real (25/09, ver README "sujeto
+        # omitido"): "¿A qué hora abre el martes?" ya viene con "?" así que ningún filtro barato
+        # (looks_like_statement, looks_compound) la agarraba, y sin historial no había de dónde
+        # completar "la oficina" -- el reescritor ahora corre siempre (ver LocalLLM.rewrite_query)
+        # y esta instrucción/ejemplo es lo que le enseña a completar el sujeto genérico, no el
+        # historial. A PROPÓSITO no va al final de la lista, ver comentario en el último few-shot.
+        [],
+        "¿A qué hora abre el martes?",
+        "¿A qué hora abre {default_subject} el martes?",
+    ),
+    (
+        # contraejemplo, agregado junto con el de arriba: sujeto YA explícito (una persona, no el
+        # negocio) -- NO hay que reemplazarlo por el default ni agregarlo igual. Sin este ejemplo,
+        # el riesgo real es que el modelo generalice de más "toda pregunta sin sujeto de negocio
+        # completo con {default_subject}" en vez de "solo si el sujeto está genuinamente ausente".
+        [],
+        "¿A qué se dedica Juan?",
+        "¿A qué se dedica Juan?",
+    ),
+    (
         # afirmación (sin "?") como confirmación de sí/no, CON historial -- arrastra el sujeto.
         # A PROPÓSITO usa un tema distinto (sala de reuniones) al de arriba (oficina/horario): 3
         # ejemplos seguidos casi idénticos en tema hacían que el 3B, ante una entrada nueva sin
@@ -121,7 +148,14 @@ _EXAMPLES: list[tuple[list[tuple[str, str]], str, str]] = [
     (
         # afirmación aislada, SIN historial (primer turno de la charla), tema distinto de todos
         # los anteriores (vacaciones) -- se convierte a pregunta igual, aunque no haya sujeto del
-        # historial para completarla
+        # historial para completarla. A PROPÓSITO queda como el ÚLTIMO few-shot de la lista (ver
+        # más abajo): recency bias real en un 3B (mismo motivo que el comentario de "sala Norte"
+        # más arriba) -- este es el patrón que más importa tener "fresco" para una entrada de
+        # primer turno sin relación con nada anterior. Los 2 ejemplos de sujeto omitido (agregados
+        # 25/09) NO van al final por el mismo motivo: puestos ahí, un 3B copiaba literalmente la
+        # respuesta del último few-shot ("¿A qué se dedica Juan?") para CUALQUIER entrada nueva sin
+        # relación -- bug real encontrado al agregarlos (ver tests/eval_questions.yaml:
+        # rewrite_afirmacion_primer_turno, que empezó a fallar exactamente así).
         [],
         "Las vacaciones se piden con dos semanas de anticipación.",
         "¿Las vacaciones se piden con dos semanas de anticipación?",
@@ -154,11 +188,20 @@ def format_input(history: list[tuple[str, str]], question: str) -> str:
     return "\n".join(lines)
 
 
-def few_shot_messages() -> list[dict]:
+def build_system_prompt(default_subject: str) -> str:
+    """SYSTEM_PROMPT trae un placeholder "{default_subject}" (ver instrucción de sujeto omitido,
+    25/09) -- se completa acá con el valor de config (voice/config.py: RewriteCfg.default_subject),
+    nunca hardcodeado en el prompt."""
+    return SYSTEM_PROMPT.format(default_subject=default_subject)
+
+
+def few_shot_messages(default_subject: str) -> list[dict]:
+    """default_subject completa el placeholder "{default_subject}" en los ejemplos que lo traen
+    (ver _EXAMPLES, caso de sujeto omitido) -- .format() en los que no lo traen es un no-op."""
     msgs = []
     for history, question, rewritten in _EXAMPLES:
         msgs.append({"role": "user", "content": format_input(history, question)})
-        msgs.append({"role": "assistant", "content": rewritten})
+        msgs.append({"role": "assistant", "content": rewritten.format(default_subject=default_subject)})
     return msgs
 
 

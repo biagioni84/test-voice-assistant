@@ -112,14 +112,22 @@ respuesta, decilo con honestidad. Si el CONTEXTO no tiene que ver con la pregunt
 completo y respondé como asistente general, sin forzarlo ni mencionarlo."""
 
 [rewrite]
-# Reescribe la pregunta de seguimiento en una autónoma ANTES del retrieval (reemplaza al viejo
-# fallback de "sticky hits"). Ver voice/rewrite.py y README. Usa el mismo LLM (Qwen2.5-3B), una
-# llamada extra por turno -- se paga sin historial también si la entrada es compuesta
-# (looks_compound) o tiene pinta de afirmación sin forma de pregunta (looks_like_statement); una
-# pregunta simple bien formada en el primer turno sigue sin pagarla.
+# Reescribe la pregunta en una autónoma ANTES del retrieval (reemplaza al viejo fallback de
+# "sticky hits"). Ver voice/rewrite.py y README. Usa el mismo LLM (Qwen2.5-3B), una llamada extra
+# por turno -- CORRE SIEMPRE (25/09, ver README "sujeto omitido"), incluso en una pregunta simple,
+# bien formada, de primer turno, sin historial: el bug real que motivó esto es que una pregunta
+# como "¿A qué hora abre el martes?" (sujeto omitido, sin decir "la oficina") ya viene con "?" y
+# sin historial de dónde completar el sujeto -- antes de esto, eso hacía que se saltee la
+# reescritura por completo y el retrieval fallara por falta del sujeto, no por "martes". Único caso
+# que sigue sin pagarla: charla social reconocida (guardrails.is_chitchat) -- no hay nada que
+# completar ahí, y sería latencia pura sin beneficio.
 enabled = true
 history_turns = 2          # últimos N turnos (usuario+asistente) que ve el reescritor
 max_tokens = 40             # una pregunta reescrita es corta; esto es tope, no objetivo
+# Sujeto por defecto para completar preguntas que lo omiten (ver voice/rewrite.py: SYSTEM_PROMPT,
+# instrucción de sujeto omitido) -- NO hardcodeado en el prompt, se inyecta desde acá. Cambiar si
+# el sujeto genérico del negocio no es "la oficina" (p.ej. "el local", "la clínica").
+default_subject = "la oficina"
 
 [canonical]
 # Respuestas canónicas (FAQ con texto fijo, redactado por la empresa) -- ver voice/canonical.py y
